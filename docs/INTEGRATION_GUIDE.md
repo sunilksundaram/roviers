@@ -1,31 +1,31 @@
-# Roviers Integration & Client User Guide 🧩
+# Roviers Broker & Agent Integration Guide 🧩
 
-This guide provides end-to-end integration patterns and copy-pasteable code samples for **AI Agents**, **RAG Applications**, and **Standard Web Applications**.
+This guide provides end-to-end integration patterns and copy-pasteable code samples for **Autonomous AI Agents**, **RAG Pipelines**, and **Web Applications** using the **Broker & Agent** architecture.
 
 ---
 
 ## 📋 Table of Contents
-1. [Core Client Interaction Pattern](#1-core-client-interaction-pattern)
+1. [Core Broker & Agent Interaction Pattern](#1-core-broker--agent-interaction-pattern)
 2. [Pattern A: AI Agent & Multi-Agent Orchestrators (Python)](#2-pattern-a-ai-agent--multi-agent-orchestrators-python)
 3. [Pattern B: RAG Ingestion & Vector Indexing Pipeline (Python)](#3-pattern-b-rag-ingestion--vector-indexing-pipeline-python)
 4. [Pattern C: Standard Web Applications & Microservices (Node.js / TypeScript)](#4-pattern-c-standard-web-applications--microservices-nodejs--typescript)
-5. [Client Identity Token Management](#5-client-identity-token-management)
+5. [Agent Token Issuance & Management](#5-agent-token-issuance--management)
 
 ---
 
-## 1. Core Client Interaction Pattern
+## 1. Core Broker & Agent Interaction Pattern
 
 Every integration with Roviers follows three decoupled steps:
 
 ```text
-[Step 1: Submit]       Client  ──POST /api/v1/services/{name}──►  Roviers Counter
-                       Client  ◄── HTTP 202 + Claim-Check Receipt ──  (Connection closes!)
+[Step 1: Submit]       Agent   ──POST /api/v1/services/{name}──►  Roviers Broker
+                       Agent   ◄── HTTP 202 + Claim-Check Receipt ──  (Connection closes in ~2ms!)
 
-[Step 2: Intimate]     Roviers ── SSE Intimation Notice ───────►  Client Listener
-                       ("Receipt #UUID completed and deposited in vault")
+[Step 2: Signal]       Broker  ── SSE AgentSignal / Webhook ───►  Agent Listener
+                       ("Receipt #UUID completed and deposited in Broker Vault")
 
-[Step 3: Redeem]       Client  ──POST /api/v1/receipts/{id}/pickup──► Roviers Vault
-                       Client  ◄── HTTP 200 + Final Verified Outcome ──
+[Step 3: Redeem]       Agent   ──POST /api/v1/receipts/{id}/pickup──► Roviers Vault
+                       Agent   ◄── HTTP 200 + Final Verified Outcome ──
 ```
 
 ---
@@ -61,7 +61,7 @@ class RoviersAgentClient:
             request_body = {
                 "request_id": None, # Generated server-side if omitted
                 "service_name": service_topic,
-                "citizen_token": self.token_data,
+                "agent_token": self.token_data,
                 "payload": payload,
                 "callback_url": None
             }
@@ -84,7 +84,7 @@ class RoviersAgentClient:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{self.base_url}/api/v1/receipts/{receipt_id}/pickup",
-                json={"citizen_token": self.token_data},
+                json={"agent_token": self.token_data},
                 timeout=10.0
             )
             if resp.status_code == 202:
@@ -97,8 +97,8 @@ class RoviersAgentClient:
         """
         Zero-polling listener over SSE. Wakes up the agent the moment the vault has the outcome.
         """
-        print(f"👂 [Agent] Listening for intimation on SSE for #{expected_receipt_id}...")
-        url = f"{self.base_url}/api/v1/citizens/{self.agent_id}/stream"
+        print(f"👂 [Agent] Listening for signal on SSE for #{expected_receipt_id}...")
+        url = f"{self.base_url}/api/v1/agents/{self.agent_id}/stream"
 
         async with httpx.AsyncClient(timeout=timeout_secs) as client:
             async with client.stream("GET", url) as stream:
@@ -106,11 +106,11 @@ class RoviersAgentClient:
                     if line.startswith("data:"):
                         event_data = json.loads(line[5:].strip())
                         if event_data.get("receipt_id") == expected_receipt_id:
-                            print(f"⚡ [Agent] Intimation received! Task ready for pickup.")
+                            print(f"⚡ [Agent] Signal received! Task ready for pickup.")
                             # Step 3: Redeem verified outcome from the Vault
                             return await self.redeem_outcome(expected_receipt_id)
 
-        raise TimeoutError("Timed out waiting for task intimation.")
+        raise TimeoutError("Timed out waiting for task signal.")
 
 # -----------------
 # Example Execution
@@ -186,7 +186,7 @@ async def ingest_document(file: UploadFile = File(...)):
             f"{ROVIERS_URL}/api/v1/services/service.rag.document_index",
             json={
                 "service_name": "service.rag.document_index",
-                "citizen_token": RAG_SERVICE_TOKEN,
+                "agent_token": RAG_SERVICE_TOKEN,
                 "payload": payload,
                 "callback_url": None
             }
@@ -212,7 +212,7 @@ async def check_index_status(receipt_id: str):
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{ROVIERS_URL}/api/v1/receipts/{receipt_id}/pickup",
-            json={"citizen_token": RAG_SERVICE_TOKEN}
+            json={"agent_token": RAG_SERVICE_TOKEN}
         )
 
         if resp.status_code == 202:
@@ -261,7 +261,7 @@ app.post('/api/reports/generate', async (req: Request, res: Response) => {
       `${ROVIERS_URL}/api/v1/services/service.reporting.financial_export`,
       {
         service_name: 'service.reporting.financial_export',
-        citizen_token: WEBAPP_TOKEN,
+        agent_token: WEBAPP_TOKEN,
         payload: { month, year, accountId },
         callback_url: null
       }
@@ -284,17 +284,17 @@ app.post('/api/reports/generate', async (req: Request, res: Response) => {
 
 /**
  * 2. Real-Time Browser Notification Proxy (SSE)
- * Pipes Roviers intimations directly to client browser
+ * Pipes Roviers signals directly to client browser
  */
-app.get('/api/reports/notifications/:clientId', (req: Request, res: Response) => {
-  const { clientId } = req.params;
+app.get('/api/reports/notifications/:agentId', (req: Request, res: Response) => {
+  const { agentId } = req.params;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  const eventSource = new EventSource(`${ROVIERS_URL}/api/v1/citizens/${clientId}/stream`);
+  const eventSource = new EventSource(`${ROVIERS_URL}/api/v1/agents/${agentId}/stream`);
 
   eventSource.onmessage = (event) => {
     res.write(`data: ${event.data}\n\n`);
@@ -315,7 +315,7 @@ app.get('/api/reports/download/:receiptId', async (req: Request, res: Response) 
     const vaultResponse = await axios.post(
       `${ROVIERS_URL}/api/v1/receipts/${receiptId}/pickup`,
       {
-        citizen_token: WEBAPP_TOKEN
+        agent_token: WEBAPP_TOKEN
       }
     );
 
@@ -340,26 +340,26 @@ app.listen(3000, () => {
 
 ---
 
-## 5. Client Identity Token Management
+## 5. Agent Token Issuance & Management
 
-Clients authenticate using an Ed25519-signed identity credential issued by the Roviers authority.
+Agents authenticate using an Ed25519-signed identity credential issued by the Roviers Broker.
 
-### Issuing a Token via CLI
+### Issuing an Agent Token via CLI
 ```bash
-cargo run -p roviers-cli -- issue-citizen \
-  --id "CLIENT-AI-AGENT-01" \
-  --name "Autonomous Production Worker" \
+cargo run -p roviers-cli -- issue-agent \
+  --id "AGENT-RESEARCH-01" \
+  --name "Autonomous Research Agent" \
   --validity-days 365 \
-  --out agent_id.json
+  --out agent_token.json
 ```
 
-### Issuing a Token via HTTP API
+### Issuing an Agent Token via HTTP API
 ```bash
-curl -X POST http://127.0.0.1:8080/api/v1/auth/citizen \
+curl -X POST http://127.0.0.1:8080/api/v1/auth/agent \
   -H "Content-Type: application/json" \
   -d '{
-    "citizen_id": "CLIENT-WEBAPP-01",
-    "full_name": "Production Web Cluster",
+    "agent_id": "AGENT-WEBAPP-01",
+    "agent_name": "Production Web Agent",
     "validity_days": 365
   }' > webapp_token.json
 ```

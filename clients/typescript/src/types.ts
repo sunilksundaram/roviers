@@ -1,19 +1,19 @@
-export interface CitizenCredentials {
-  citizen_id: string;
-  full_name: string;
+export interface AgentCredentials {
+  agent_id: string;
+  agent_name: string;
   issued_at: number;
   expires_at: number;
   scopes: string[];
 }
 
-export interface SignedCitizenToken {
-  credentials: CitizenCredentials;
+export interface SignedAgentToken {
+  credentials: AgentCredentials;
   signature_bytes: number[];
 }
 
 export interface RoviersReceipt {
   receipt_id: string;
-  citizen_id: string;
+  agent_id: string;
   service_name: string;
   issued_at: number;
   status: 'Queued' | 'Processing' | 'ReadyForPickup' | 'Fulfilled' | { Failed: string };
@@ -23,19 +23,27 @@ export interface RoviersReceipt {
 
 export interface RoviersOutcome<T = any> {
   receipt_id: string;
-  citizen_id: string;
+  agent_id: string;
   service_name: string;
   completed_at: number;
   result: T;
 }
 
-export interface IntimationNotice {
-  intimation_id: string;
+export interface AgentSignal {
+  signal_id: string;
   receipt_id: string;
-  citizen_id: string;
+  agent_id: string;
   service_name: string;
   status: any;
   message: string;
   pickup_url: string;
   timestamp: number;
 }
+
+// Backwards-compatibility aliases
+export type CitizenCredentials = AgentCredentials;
+export type SignedCitizenToken = SignedAgentToken;
+export type IntimationNotice = AgentSignal;
+export type ClientCredentials = AgentCredentials;
+export type SignedClientToken = SignedAgentToken;
+export type NotificationNotice = AgentSignal;

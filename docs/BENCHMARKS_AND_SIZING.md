@@ -55,8 +55,8 @@ Max          9.20 ms
 
 ---
 
-### 2. Zero-Polling SSE Intimation Stream
-The Server-Sent Events (SSE) notification channel alerts clients when their task outcome is deposited into the vault.
+### 2. Zero-Polling SSE Signal Stream
+The Server-Sent Events (SSE) signal channel alerts agents when their task outcome is deposited into the vault.
 
 - **Concurrent Connected Listeners:** **75,000 – 100,000 concurrent SSE connections** per 8 vCPU server.
 - **Memory Consumption per Idle Connection:** ~2.8 KB (managed in kernel epoll/kqueue buffers via Tokio).

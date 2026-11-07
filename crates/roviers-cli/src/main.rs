@@ -1,12 +1,12 @@
 use clap::{Parser, Subcommand};
 use reqwest::Client;
-use roviers_proto::{Receipt, ServiceOutcome, ServiceRequest, SignedCitizenToken};
+use roviers_proto::{Receipt, ServiceOutcome, ServiceRequest, SignedAgentToken};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Roviers Civic Protocol CLI")]
+#[command(author, version, about = "Roviers: Broker & Claim-Check Vault CLI")]
 struct Cli {
     #[arg(short, long, default_value = "http://127.0.0.1:8080")]
     server: String,
@@ -17,46 +17,57 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Issue a new citizen ID card from the server
-    IssueCitizen {
+    /// Issue a new agent identity token from the Broker
+    #[command(alias = "issue-citizen")]
+    IssueAgent {
         #[arg(short, long)]
         id: String,
         #[arg(short, long)]
         name: String,
         #[arg(short, long, default_value = "365")]
         validity_days: i64,
-        #[arg(short, long, default_value = "citizen_id.json")]
+        #[arg(short, long, default_value = "agent_id.json")]
         out: PathBuf,
     },
 
-    /// Submit a service request at the counter and receive a Receipt
+    /// Submit a service request to the Broker ingress and receive a Receipt
     Submit {
         #[arg(short, long)]
         service: String,
-        #[arg(short, long, default_value = "citizen_id.json")]
+        #[arg(short, long, default_value = "agent_id.json")]
         token_file: PathBuf,
         #[arg(short, long, default_value = "{}")]
         data: String,
+        #[arg(short, long)]
+        callback: Option<String>,
     },
 
-    /// Check status of a receipt
+    /// Check status of an issued receipt
     Status {
         #[arg(short, long)]
         receipt: Uuid,
     },
 
-    /// Redeem receipt and collect final service outcome
+    /// Redeem receipt and collect final service outcome from the Broker Vault
     Pickup {
         #[arg(short, long)]
         receipt: Uuid,
-        #[arg(short, long, default_value = "citizen_id.json")]
+        #[arg(short, long, default_value = "agent_id.json")]
         token_file: PathBuf,
     },
 
-    /// Listen for real-time intimation notifications via SSE stream (No polling!)
-    Listen {
+    /// Worker command: Deposit final task outcome into the Vault for a receipt
+    Complete {
         #[arg(short, long)]
-        citizen_id: String,
+        receipt: Uuid,
+        #[arg(short, long, default_value = "{}")]
+        data: String,
+    },
+
+    /// Listen for real-time completion signals via SSE stream (Zero polling!)
+    Listen {
+        #[arg(short, long, alias = "citizen-id")]
+        agent_id: String,
     },
 
     /// Run full automated end-to-end demonstration
@@ -69,48 +80,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new();
 
     match cli.command {
-        Commands::IssueCitizen {
+        Commands::IssueAgent {
             id,
             name,
             validity_days,
             out,
         } => {
-            println!("🪪 Requesting new Citizen ID Card from Roviers Authority...");
+            println!("🤖 Requesting new Agent Token from Roviers Broker...");
             let res = client
-                .post(format!("{}/api/v1/auth/citizen", cli.server))
+                .post(format!("{}/api/v1/auth/agent", cli.server))
                 .json(&serde_json::json!({
-                    "citizen_id": id,
-                    "full_name": name,
+                    "agent_id": id,
+                    "agent_name": name,
                     "validity_days": validity_days
                 }))
                 .send()
                 .await?;
 
             if !res.status().is_success() {
-                eprintln!("❌ Failed to issue ID: {}", res.text().await?);
+                eprintln!("❌ Failed to issue Agent Token: {}", res.text().await?);
                 return Ok(());
             }
 
-            let token: SignedCitizenToken = res.json().await?;
+            let token: SignedAgentToken = res.json().await?;
             let json = serde_json::to_string_pretty(&token)?;
             fs::write(&out, json)?;
-            println!("✅ Citizen ID Card issued and saved to {}", out.display());
-            println!("   Citizen ID: {}", token.credentials.citizen_id);
-            println!("   Holder Name: {}", token.credentials.full_name);
-            println!("   Expires at (Unix): {}", token.credentials.expires_at);
+            println!("✅ Agent Token issued and saved to {}", out.display());
+            println!("   Agent ID:   {}", token.credentials.agent_id);
+            println!("   Agent Name: {}", token.credentials.agent_name);
+            println!("   Expires at: {}", token.credentials.expires_at);
         }
 
         Commands::Submit {
             service,
             token_file,
             data,
+            callback,
         } => {
             let token_str = fs::read_to_string(&token_file)?;
-            let token: SignedCitizenToken = serde_json::from_str(&token_str)?;
+            let token: SignedAgentToken = serde_json::from_str(&token_str)?;
             let payload: serde_json::Value = serde_json::from_str(&data)?;
 
-            println!("🏛️ Visiting Roviers Service Counter for '{}'...", service);
-            let req = ServiceRequest::new(service.clone(), token, payload, None);
+            println!("🏛️ Dispatching task to Roviers Broker for '{}'...", service);
+            let req = ServiceRequest::new(service.clone(), token, payload, callback);
 
             let res = client
                 .post(format!("{}/api/v1/services/{}", cli.server, service))
@@ -126,11 +138,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let receipt: Receipt = res.json().await?;
             println!("🎟️ Claim-Check Receipt Issued!");
             println!("   Receipt ID:   {}", receipt.receipt_id);
-            println!("   Citizen ID:   {}", receipt.citizen_id);
+            println!("   Agent ID:     {}", receipt.agent_id);
             println!("   Service:      {}", receipt.service_name);
             println!("   Status:       {:?}", receipt.status);
             println!("   Est. Ready:   {:?} seconds", receipt.estimated_ready_secs);
-            println!("\n💡 You can now disconnect. You will receive an Intimation when ready.");
+            println!("\n💡 Connection freed. You will receive an SSE Signal or Webhook when ready.");
         }
 
         Commands::Status { receipt } => {
@@ -147,7 +159,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let r: Receipt = res.json().await?;
             println!("📋 Receipt Status:");
             println!("   ID:     {}", r.receipt_id);
+            println!("   Agent:  {}", r.agent_id);
             println!("   Status: {:?}", r.status);
+        }
+
+        Commands::Complete { receipt, data } => {
+            let result_val: serde_json::Value = serde_json::from_str(&data)
+                .map_err(|e| format!("Invalid JSON data: {}", e))?;
+
+            println!("👷 Worker depositing outcome into Broker Vault for receipt #{}...", receipt);
+            let res = client
+                .post(format!("{}/api/v1/receipts/{}/complete", cli.server, receipt))
+                .json(&serde_json::json!({ "result": result_val }))
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                eprintln!("❌ Failed to complete receipt: {}", res.text().await?);
+                return Ok(());
+            }
+
+            println!("✅ Service outcome recorded in Vault. Signals and webhooks dispatched.");
         }
 
         Commands::Pickup {
@@ -155,13 +187,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token_file,
         } => {
             let token_str = fs::read_to_string(&token_file)?;
-            let token: SignedCitizenToken = serde_json::from_str(&token_str)?;
+            let token: SignedAgentToken = serde_json::from_str(&token_str)?;
 
-            println!("📦 Presenting Receipt #{} at pickup counter...", receipt);
+            println!("📦 Presenting Receipt #{} at Broker Vault...", receipt);
             let res = client
                 .post(format!("{}/api/v1/receipts/{}/pickup", cli.server, receipt))
                 .json(&serde_json::json!({
-                    "citizen_token": token
+                    "agent_token": token
                 }))
                 .send()
                 .await?;
@@ -172,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let outcome: ServiceOutcome = res.json().await?;
-            println!("🎉 Outcome Retrieved Successfully!");
+            println!("🎉 Outcome Retrieved from Vault Successfully!");
             println!("   Completed At: {}", outcome.completed_at);
             println!(
                 "   Outcome Result:\n{}",
@@ -180,53 +212,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Commands::Listen { citizen_id } => {
-            println!("👂 Listening for real-time intimations for citizen '{}' (SSE)...", citizen_id);
+        Commands::Listen { agent_id } => {
+            println!("👂 Listening for real-time signals for agent '{}' (SSE)...", agent_id);
             let mut res = client
-                .get(format!("{}/api/v1/citizens/{}/stream", cli.server, citizen_id))
+                .get(format!("{}/api/v1/agents/{}/stream", cli.server, agent_id))
                 .send()
                 .await?;
 
             while let Some(chunk) = res.chunk().await? {
                 let text = String::from_utf8_lossy(&chunk);
                 if text.contains("data:") {
-                    println!("🔔 INTIMATION RECEIVED:\n{}", text);
+                    println!("🔔 SIGNAL RECEIVED:\n{}", text);
                 }
             }
         }
 
         Commands::Demo => {
-            println!("🚀 Running Full Civic Protocol Demonstration...\n");
-            // 1. Issue ID
+            println!("🚀 Running Full Broker & Agent Demonstration...\n");
+            // 1. Issue Agent Token
             let issue_res = client
-                .post(format!("{}/api/v1/auth/citizen", cli.server))
+                .post(format!("{}/api/v1/auth/agent", cli.server))
                 .json(&serde_json::json!({
-                    "citizen_id": "CTZ-2026-DEMO-01",
-                    "full_name": "Eleanor Vance",
+                    "agent_id": "AGENT-2026-DEMO-01",
+                    "agent_name": "Autonomous Research Agent",
                     "validity_days": 365
                 }))
                 .send()
                 .await?;
 
-            let token: SignedCitizenToken = issue_res.json().await?;
-            println!("1️⃣ [CITIZEN ID] Issued verified ID for: {} ({})", token.credentials.full_name, token.credentials.citizen_id);
+            let token: SignedAgentToken = issue_res.json().await?;
+            println!("1️⃣ [AGENT TOKEN] Issued verified token for: {} ({})", token.credentials.agent_name, token.credentials.agent_id);
 
             // 2. Submit Request
             let req = ServiceRequest::new(
-                "vital_records.birth_certificate",
+                "ai.document_analysis",
                 token.clone(),
-                serde_json::json!({ "applicant_notes": "Official certified copy" }),
+                serde_json::json!({ "document_id": "DOC-9912", "priority": "high" }),
                 None,
             );
 
             let submit_res = client
-                .post(format!("{}/api/v1/services/vital_records.birth_certificate", cli.server))
+                .post(format!("{}/api/v1/services/ai.document_analysis", cli.server))
                 .json(&req)
                 .send()
                 .await?;
 
             let receipt: Receipt = submit_res.json().await?;
-            println!("2️⃣ [RECEIPT TOKEN] Service counter accepted request!");
+            println!("2️⃣ [RECEIPT TOKEN] Broker accepted request!");
             println!("   Issued Receipt: #{} (Status: {:?})", receipt.receipt_id, receipt.status);
             println!("3️⃣ [ASYNC WORK] Worker pool processing in background... (Waiting for worker completion)");
 
@@ -236,17 +268,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 4. Pickup outcome
             let pickup_res = client
                 .post(format!("{}/api/v1/receipts/{}/pickup", cli.server, receipt.receipt_id))
-                .json(&serde_json::json!({ "citizen_token": token }))
+                .json(&serde_json::json!({ "agent_token": token }))
                 .send()
                 .await?;
 
             let outcome: ServiceOutcome = pickup_res.json().await?;
-            println!("4️⃣ [OUTCOME PICKUP] Citizen presented receipt and collected final outcome:");
+            println!("4️⃣ [OUTCOME PICKUP] Agent presented receipt and collected final outcome from Vault:");
             println!("{}", serde_json::to_string_pretty(&outcome.result)?);
-            println!("\n✨ Full end-to-end flow verified with zero polling and decoupled state!");
+            println!("\n✨ Full end-to-end flow verified: non-blocking Broker ingress, async execution, and Vault redemption!");
         }
     }
 
     Ok(())
 }
-

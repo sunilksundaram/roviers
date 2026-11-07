@@ -8,7 +8,7 @@ use uuid::Uuid;
 pub enum ProtoError {
     #[error("Invalid signature: {0}")]
     InvalidSignature(String),
-    #[error("Citizen ID token has expired at {0}")]
+    #[error("Agent token has expired at {0}")]
     TokenExpired(i64),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -16,22 +16,22 @@ pub enum ProtoError {
     KeyError(String),
 }
 
-/// The verified citizen identity payload
+/// The verified agent identity payload
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CitizenCredentials {
-    pub citizen_id: String,
-    pub full_name: String,
+pub struct AgentCredentials {
+    pub agent_id: String,
+    pub agent_name: String,
     pub issued_at: i64,
     pub expires_at: i64,
     pub scopes: Vec<String>,
 }
 
-impl CitizenCredentials {
-    pub fn new(citizen_id: impl Into<String>, full_name: impl Into<String>, validity_secs: i64) -> Self {
+impl AgentCredentials {
+    pub fn new(agent_id: impl Into<String>, agent_name: impl Into<String>, validity_secs: i64) -> Self {
         let now = Utc::now().timestamp();
         Self {
-            citizen_id: citizen_id.into(),
-            full_name: full_name.into(),
+            agent_id: agent_id.into(),
+            agent_name: agent_name.into(),
             issued_at: now,
             expires_at: now + validity_secs,
             scopes: vec!["service:all".into()],
@@ -43,16 +43,16 @@ impl CitizenCredentials {
     }
 }
 
-/// Cryptographically signed citizen token (The Digital ID Card)
+/// Cryptographically signed agent token (The Stateless Identity Credential)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SignedCitizenToken {
-    pub credentials: CitizenCredentials,
+pub struct SignedAgentToken {
+    pub credentials: AgentCredentials,
     pub signature_bytes: Vec<u8>,
 }
 
-impl SignedCitizenToken {
-    /// Issues a new signed citizen card using government authority signing key
-    pub fn issue(credentials: CitizenCredentials, signing_key: &SigningKey) -> Result<Self, ProtoError> {
+impl SignedAgentToken {
+    /// Issues a new signed agent credential using broker signing key
+    pub fn issue(credentials: AgentCredentials, signing_key: &SigningKey) -> Result<Self, ProtoError> {
         let payload_bytes = serde_json::to_vec(&credentials)?;
         let signature = signing_key.sign(&payload_bytes);
         Ok(Self {
@@ -61,8 +61,8 @@ impl SignedCitizenToken {
         })
     }
 
-    /// Statelessly verifies the citizen card against the government public key
-    pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<&CitizenCredentials, ProtoError> {
+    /// Statelessly verifies the agent credential against the broker public key
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<&AgentCredentials, ProtoError> {
         let payload_bytes = serde_json::to_vec(&self.credentials)?;
         let sig_bytes: [u8; 64] = self
             .signature_bytes
@@ -83,12 +83,12 @@ impl SignedCitizenToken {
     }
 }
 
-/// Citizen request presented at the service counter
+/// Service request presented to the Broker ingress
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRequest {
     pub request_id: Uuid,
     pub service_name: String,
-    pub citizen_token: SignedCitizenToken,
+    pub agent_token: SignedAgentToken,
     pub payload: serde_json::Value,
     pub callback_url: Option<String>,
 }
@@ -96,21 +96,21 @@ pub struct ServiceRequest {
 impl ServiceRequest {
     pub fn new(
         service_name: impl Into<String>,
-        citizen_token: SignedCitizenToken,
+        agent_token: SignedAgentToken,
         payload: serde_json::Value,
         callback_url: Option<String>,
     ) -> Self {
         Self {
             request_id: Uuid::now_v7(),
             service_name: service_name.into(),
-            citizen_token,
+            agent_token,
             payload,
             callback_url,
         }
     }
 }
 
-/// Receipt (The Claim-Check token given to the citizen)
+/// Status of an issued receipt
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReceiptStatus {
     Queued,
@@ -120,10 +120,11 @@ pub enum ReceiptStatus {
     Failed(String),
 }
 
+/// Receipt (The Claim-Check token given to the agent)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
     pub receipt_id: Uuid,
-    pub citizen_id: String,
+    pub agent_id: String,
     pub service_name: String,
     pub issued_at: i64,
     pub status: ReceiptStatus,
@@ -136,7 +137,7 @@ impl Receipt {
     pub fn from_request(req: &ServiceRequest, estimated_ready_secs: Option<u64>) -> Self {
         Self {
             receipt_id: req.request_id,
-            citizen_id: req.citizen_token.credentials.citizen_id.clone(),
+            agent_id: req.agent_token.credentials.agent_id.clone(),
             service_name: req.service_name.clone(),
             issued_at: Utc::now().timestamp(),
             status: ReceiptStatus::Queued,
@@ -146,22 +147,22 @@ impl Receipt {
     }
 }
 
-/// The final outcome / output of the service
+/// The final outcome / output of the service stored in the Broker Vault
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceOutcome {
     pub receipt_id: Uuid,
-    pub citizen_id: String,
+    pub agent_id: String,
     pub service_name: String,
     pub completed_at: i64,
     pub result: serde_json::Value,
 }
 
-/// The intimation signal sent to notify the citizen to pick up their outcome
+/// Notification signal pushed to the agent when their outcome is ready
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IntimationNotice {
-    pub intimation_id: Uuid,
+pub struct AgentSignal {
+    pub signal_id: Uuid,
     pub receipt_id: Uuid,
-    pub citizen_id: String,
+    pub agent_id: String,
     pub service_name: String,
     pub status: ReceiptStatus,
     pub message: String,
@@ -169,44 +170,51 @@ pub struct IntimationNotice {
     pub timestamp: i64,
 }
 
+// Backwards-compatibility aliases
+pub type CitizenCredentials = AgentCredentials;
+pub type SignedCitizenToken = SignedAgentToken;
+pub type IntimationNotice = AgentSignal;
+pub type ClientCredentials = AgentCredentials;
+pub type SignedClientToken = SignedAgentToken;
+pub type NotificationNotice = AgentSignal;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::rngs::OsRng;
 
     #[test]
-    fn test_citizen_id_lifecycle_and_verification() {
+    fn test_agent_id_lifecycle_and_verification() {
         let mut rng = OsRng;
         let signing_key = SigningKey::generate(&mut rng);
         let verifying_key = signing_key.verifying_key();
 
-        // 1. Issue valid ID
-        let creds = CitizenCredentials::new("CTZ-2026-999", "Sarah Connor", 3600);
-        let token = SignedCitizenToken::issue(creds, &signing_key).expect("Token issue failed");
+        // 1. Issue valid agent credential
+        let creds = AgentCredentials::new("AGENT-RESEARCH-01", "Research Agent", 3600);
+        let token = SignedAgentToken::issue(creds, &signing_key).expect("Token issue failed");
 
         // 2. Stateless verify
         let verified = token.verify(&verifying_key).expect("Verification failed");
-        assert_eq!(verified.citizen_id, "CTZ-2026-999");
-        assert_eq!(verified.full_name, "Sarah Connor");
+        assert_eq!(verified.agent_id, "AGENT-RESEARCH-01");
+        assert_eq!(verified.agent_name, "Research Agent");
 
         // 3. Verify with wrong key
         let wrong_key = SigningKey::generate(&mut rng).verifying_key();
         assert!(token.verify(&wrong_key).is_err());
 
         // 4. Test expired token
-        let expired_creds = CitizenCredentials {
-            citizen_id: "CTZ-EXPIRED".into(),
-            full_name: "John Doe".into(),
+        let expired_creds = AgentCredentials {
+            agent_id: "AGENT-EXPIRED".into(),
+            agent_name: "Expired Agent".into(),
             issued_at: Utc::now().timestamp() - 7200,
             expires_at: Utc::now().timestamp() - 3600,
             scopes: vec!["all".into()],
         };
         let expired_token =
-            SignedCitizenToken::issue(expired_creds, &signing_key).expect("Token issue failed");
+            SignedAgentToken::issue(expired_creds, &signing_key).expect("Token issue failed");
         match expired_token.verify(&verifying_key) {
             Err(ProtoError::TokenExpired(_)) => {}
             other => panic!("Expected TokenExpired, got {:?}", other),
         }
     }
 }
-

@@ -3,8 +3,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use roviers_ledger::{DedupLog, Ledger, LedgerError, TopicTrie};
 use roviers_proto::{
-    CitizenCredentials, IntimationNotice, ProtoError, Receipt, ReceiptStatus, ServiceOutcome,
-    ServiceRequest, SignedCitizenToken,
+    AgentCredentials, AgentSignal, ProtoError, Receipt, ReceiptStatus, ServiceOutcome,
+    ServiceRequest, SignedAgentToken,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,8 +23,8 @@ pub enum CoreError {
     DuplicateRequest(String),
     #[error("Receipt {0} not found")]
     ReceiptNotFound(Uuid),
-    #[error("Unauthorized: Citizen ID does not match receipt owner")]
-    CitizenMismatch,
+    #[error("Unauthorized: Agent ID does not match receipt owner")]
+    AgentMismatch,
     #[error("Outcome for receipt {0} is not ready yet")]
     OutcomeNotReady(Uuid),
     #[error("JSON serialization error: {0}")]
@@ -33,8 +33,19 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
 }
 
-/// The core civic coordination engine
+// Backwards compatibility aliases
+#[allow(non_upper_case_globals)]
+pub const CitizenMismatch: fn() -> CoreError = || CoreError::AgentMismatch;
+#[allow(non_upper_case_globals)]
+pub const ClientMismatch: fn() -> CoreError = || CoreError::AgentMismatch;
+
+/// The core broker engine
 pub struct RoviersEngine {
+    pub broker_signing_key: SigningKey,
+    pub broker_verifying_key: VerifyingKey,
+    // Aliases for backwards compatibility
+    pub authority_signing_key: SigningKey,
+    pub authority_verifying_key: VerifyingKey,
     pub gov_signing_key: SigningKey,
     pub gov_verifying_key: VerifyingKey,
     pub ledger: Arc<Mutex<Ledger>>,
@@ -43,7 +54,7 @@ pub struct RoviersEngine {
     vault_dir: PathBuf,
     receipts: Arc<RwLock<HashMap<Uuid, Receipt>>>,
     outcomes: Arc<RwLock<HashMap<Uuid, ServiceOutcome>>>,
-    intimation_bus: broadcast::Sender<IntimationNotice>,
+    signal_bus: broadcast::Sender<AgentSignal>,
     http_client: reqwest::Client,
 }
 
@@ -52,14 +63,23 @@ impl RoviersEngine {
         let dir = ledger_dir.as_ref();
         std::fs::create_dir_all(dir)?;
 
-        // 1. Persistent Authority Key Management
-        let key_path = dir.join("gov_key.bin");
-        let gov_signing_key = if key_path.exists() {
+        // 1. Persistent Broker Key Management
+        let key_path = if dir.join("broker_key.bin").exists() {
+            dir.join("broker_key.bin")
+        } else if dir.join("authority_key.bin").exists() {
+            dir.join("authority_key.bin")
+        } else if dir.join("gov_key.bin").exists() {
+            dir.join("gov_key.bin")
+        } else {
+            dir.join("broker_key.bin")
+        };
+
+        let broker_signing_key = if key_path.exists() {
             let bytes = std::fs::read(&key_path)?;
             let key_array: [u8; 32] = bytes
                 .as_slice()
                 .try_into()
-                .map_err(|_| CoreError::Auth(ProtoError::KeyError("Invalid gov key length".into())))?;
+                .map_err(|_| CoreError::Auth(ProtoError::KeyError("Invalid broker key length".into())))?;
             SigningKey::from_bytes(&key_array)
         } else {
             let mut rng = OsRng;
@@ -67,11 +87,11 @@ impl RoviersEngine {
             std::fs::write(&key_path, key.to_bytes())?;
             key
         };
-        let gov_verifying_key = gov_signing_key.verifying_key();
+        let broker_verifying_key = broker_signing_key.verifying_key();
 
         // 2. Open Append-Only Ledger
         let ledger = Ledger::open(dir, 64 * 1024 * 1024)?;
-        let (intimation_bus, _) = broadcast::channel(50000);
+        let (signal_bus, _) = broadcast::channel(50000);
 
         // 3. Persistent Outcome Vault Initialization
         let vault_dir = dir.join("vault");
@@ -106,33 +126,56 @@ impl RoviersEngine {
             .unwrap_or_default();
 
         Ok(Self {
-            gov_signing_key,
-            gov_verifying_key,
+            broker_signing_key: broker_signing_key.clone(),
+            broker_verifying_key,
+            authority_signing_key: broker_signing_key.clone(),
+            authority_verifying_key: broker_verifying_key,
+            gov_signing_key: broker_signing_key,
+            gov_verifying_key: broker_verifying_key,
             ledger: Arc::new(Mutex::new(ledger)),
             dedup_log: Arc::new(DedupLog::new(100000)),
             topic_trie: Arc::new(TopicTrie::new()),
             vault_dir,
             receipts: Arc::new(RwLock::new(receipts_map)),
             outcomes: Arc::new(RwLock::new(outcomes_map)),
-            intimation_bus,
+            signal_bus,
             http_client,
         })
     }
 
-    /// Issue a new official Citizen ID token
+    /// Issue a new official Agent identity token
+    pub fn issue_agent_token(
+        &self,
+        agent_id: &str,
+        agent_name: &str,
+        validity_secs: i64,
+    ) -> Result<SignedAgentToken, CoreError> {
+        let creds = AgentCredentials::new(agent_id, agent_name, validity_secs);
+        let token = SignedAgentToken::issue(creds, &self.broker_signing_key)?;
+        Ok(token)
+    }
+
+    // Backwards compatibility aliases
+    pub fn issue_client_token(
+        &self,
+        client_id: &str,
+        client_name: &str,
+        validity_secs: i64,
+    ) -> Result<SignedAgentToken, CoreError> {
+        self.issue_agent_token(client_id, client_name, validity_secs)
+    }
+
     pub fn issue_citizen_id(
         &self,
         citizen_id: &str,
         full_name: &str,
         validity_secs: i64,
-    ) -> Result<SignedCitizenToken, CoreError> {
-        let creds = CitizenCredentials::new(citizen_id, full_name, validity_secs);
-        let token = SignedCitizenToken::issue(creds, &self.gov_signing_key)?;
-        Ok(token)
+    ) -> Result<SignedAgentToken, CoreError> {
+        self.issue_agent_token(citizen_id, full_name, validity_secs)
     }
 
-    /// Public service intake counter:
-    /// 1. Statelessly verifies citizen card (sub-microsecond)
+    /// Broker service intake:
+    /// 1. Statelessly verifies agent credential (sub-microsecond)
     /// 2. Checks idempotency
     /// 3. Appends transaction to immutable ledger
     /// 4. Generates claim-check Receipt and persists to Vault
@@ -141,9 +184,9 @@ impl RoviersEngine {
         &self,
         request: ServiceRequest,
     ) -> Result<Receipt, CoreError> {
-        // Step 1: Stateless verification of Citizen ID using Government Public Key
-        let creds = request.citizen_token.verify(&self.gov_verifying_key)?;
-        let citizen_id = creds.citizen_id.clone();
+        // Step 1: Stateless verification of Agent ID using Broker Public Key
+        let creds = request.agent_token.verify(&self.broker_verifying_key)?;
+        let agent_id = creds.agent_id.clone();
         let req_id_str = request.request_id.to_string();
 
         // Step 2: Idempotency deduplication check
@@ -178,9 +221,9 @@ impl RoviersEngine {
         self.topic_trie.publish(&topic, offset);
 
         tracing::info!(
-            "Accepted request {} from citizen {} on topic {} at ledger offset {}",
+            "Accepted request {} from agent {} on topic {} at ledger offset {}",
             req_id_str,
-            citizen_id,
+            agent_id,
             topic,
             offset
         );
@@ -191,11 +234,11 @@ impl RoviersEngine {
     /// Worker completion step:
     /// 1. Records final outcome in memory and disk vault
     /// 2. Updates Receipt status to ReadyForPickup on disk and memory
-    /// 3. Dispatches an Intimation Notice over SSE broadcast
+    /// 3. Dispatches an AgentSignal over SSE broadcast
     /// 4. Triggers active Webhook Callback if configured on the receipt
     pub fn complete_service(&self, outcome: ServiceOutcome) -> Result<(), CoreError> {
         let receipt_id = outcome.receipt_id;
-        let citizen_id = outcome.citizen_id.clone();
+        let agent_id = outcome.agent_id.clone();
         let service_name = outcome.service_name.clone();
 
         {
@@ -223,26 +266,26 @@ impl RoviersEngine {
             }
         };
 
-        // Emit Intimation Notice over the notification bus (SSE)
-        let notice = IntimationNotice {
-            intimation_id: Uuid::now_v7(),
+        // Emit AgentSignal over the notification bus (SSE)
+        let signal = AgentSignal {
+            signal_id: Uuid::now_v7(),
             receipt_id,
-            citizen_id: citizen_id.clone(),
+            agent_id: agent_id.clone(),
             service_name,
             status: ReceiptStatus::ReadyForPickup,
-            message: format!("Service outcome for receipt #{} is ready for collection", receipt_id),
+            message: format!("Service outcome for receipt #{} is ready in the Vault", receipt_id),
             pickup_url: format!("/api/v1/receipts/{}/pickup", receipt_id),
             timestamp: Utc::now().timestamp(),
         };
 
-        let _ = self.intimation_bus.send(notice.clone());
+        let _ = self.signal_bus.send(signal.clone());
 
         // Trigger Active Webhook Callback if present
         if let Some(url) = callback_url {
             let client = self.http_client.clone();
             tokio::spawn(async move {
                 tracing::info!("Dispatching webhook callback to {}", url);
-                match client.post(&url).json(&notice).send().await {
+                match client.post(&url).json(&signal).send().await {
                     Ok(resp) => {
                         tracing::info!("Webhook delivered to {} (HTTP {})", url, resp.status());
                     }
@@ -254,29 +297,29 @@ impl RoviersEngine {
         }
 
         tracing::info!(
-            "Service outcome recorded for receipt {}. Intimation dispatched for citizen {}",
+            "Service outcome recorded for receipt {}. Signal dispatched for agent {}",
             receipt_id,
-            citizen_id
+            agent_id
         );
 
         Ok(())
     }
 
-    /// Citizen presents receipt token to collect their outcome from the Vault
+    /// Agent presents receipt token to collect their outcome from the Vault
     pub fn pickup_outcome(
         &self,
         receipt_id: Uuid,
-        token: &SignedCitizenToken,
+        token: &SignedAgentToken,
     ) -> Result<ServiceOutcome, CoreError> {
-        let creds = token.verify(&self.gov_verifying_key)?;
+        let creds = token.verify(&self.broker_verifying_key)?;
 
         let receipts = self.receipts.read().unwrap();
         let receipt = receipts
             .get(&receipt_id)
             .ok_or(CoreError::ReceiptNotFound(receipt_id))?;
 
-        if receipt.citizen_id != creds.citizen_id {
-            return Err(CoreError::CitizenMismatch);
+        if receipt.agent_id != creds.agent_id {
+            return Err(CoreError::AgentMismatch);
         }
 
         let outcomes = self.outcomes.read().unwrap();
@@ -302,20 +345,38 @@ impl RoviersEngine {
         self.receipts.read().unwrap().get(&receipt_id).cloned()
     }
 
-    /// List all receipts belonging to a citizen
-    pub fn list_citizen_receipts(&self, citizen_id: &str) -> Vec<Receipt> {
+    /// List all receipts belonging to an agent
+    pub fn list_agent_receipts(&self, agent_id: &str) -> Vec<Receipt> {
         self.receipts
             .read()
             .unwrap()
             .values()
-            .filter(|r| r.citizen_id == citizen_id)
+            .filter(|r| r.agent_id == agent_id)
             .cloned()
             .collect()
     }
 
-    /// Subscribe to live intimation signals (used by SSE server stream)
-    pub fn subscribe_intimations(&self) -> broadcast::Receiver<IntimationNotice> {
-        self.intimation_bus.subscribe()
+    // Backwards compatibility aliases
+    pub fn list_client_receipts(&self, client_id: &str) -> Vec<Receipt> {
+        self.list_agent_receipts(client_id)
+    }
+
+    pub fn list_citizen_receipts(&self, citizen_id: &str) -> Vec<Receipt> {
+        self.list_agent_receipts(citizen_id)
+    }
+
+    /// Subscribe to live signals (used by SSE server stream)
+    pub fn subscribe_signals(&self) -> broadcast::Receiver<AgentSignal> {
+        self.signal_bus.subscribe()
+    }
+
+    // Backwards compatibility aliases
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<AgentSignal> {
+        self.subscribe_signals()
+    }
+
+    pub fn subscribe_intimations(&self) -> broadcast::Receiver<AgentSignal> {
+        self.subscribe_signals()
     }
 }
 
@@ -324,24 +385,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_full_civic_engine_lifecycle() {
+    async fn test_full_broker_engine_lifecycle() {
         let temp_dir = std::env::temp_dir().join(format!("roviers_test_{}", Uuid::now_v7()));
         let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
 
-        // 1. Issue Citizen ID Card
-        let citizen_token = engine
-            .issue_citizen_id("CTZ-TEST-42", "Alexander Hamilton", 86400)
-            .expect("Failed to issue ID");
+        // 1. Issue Agent Token
+        let agent_token = engine
+            .issue_agent_token("AGENT-TEST-42", "Autonomous Agent", 86400)
+            .expect("Failed to issue token");
 
-        assert_eq!(citizen_token.credentials.citizen_id, "CTZ-TEST-42");
+        assert_eq!(agent_token.credentials.agent_id, "AGENT-TEST-42");
 
-        // 2. Subscribe to Intimations (Citizen opens real-time listener)
-        let mut intimation_rx = engine.subscribe_intimations();
+        // 2. Subscribe to Signals (Agent opens real-time listener)
+        let mut signal_rx = engine.subscribe_signals();
 
-        // 3. Submit Service Request at the Counter
+        // 3. Submit Service Request at the Ingress
         let request = ServiceRequest::new(
             "treasury.mint_bond",
-            citizen_token.clone(),
+            agent_token.clone(),
             serde_json::json!({ "denomination": 1000 }),
             None,
         );
@@ -353,14 +414,14 @@ mod tests {
             .expect("Failed to submit request");
 
         assert_eq!(receipt.receipt_id, req_id);
-        assert_eq!(receipt.citizen_id, "CTZ-TEST-42");
+        assert_eq!(receipt.agent_id, "AGENT-TEST-42");
         assert_eq!(receipt.status, ReceiptStatus::Queued);
 
         // 4. Test Idempotency (Duplicate submission rejected immediately)
         let dup_request = ServiceRequest {
             request_id: req_id,
             service_name: "treasury.mint_bond".into(),
-            citizen_token: citizen_token.clone(),
+            agent_token: agent_token.clone(),
             payload: serde_json::json!({ "denomination": 1000 }),
             callback_url: None,
         };
@@ -370,7 +431,7 @@ mod tests {
         // 5. Worker completes service asynchronously
         let outcome = ServiceOutcome {
             receipt_id: req_id,
-            citizen_id: "CTZ-TEST-42".into(),
+            agent_id: "AGENT-TEST-42".into(),
             service_name: "treasury.mint_bond".into(),
             completed_at: Utc::now().timestamp(),
             result: serde_json::json!({ "bond_id": "BOND-9999", "status": "ISSUED" }),
@@ -378,15 +439,15 @@ mod tests {
 
         engine.complete_service(outcome).expect("Failed to complete service");
 
-        // 6. Verify Intimation was received over the broadcast bus
-        let notice = intimation_rx.recv().await.expect("Failed to receive notice");
-        assert_eq!(notice.receipt_id, req_id);
-        assert_eq!(notice.citizen_id, "CTZ-TEST-42");
-        assert_eq!(notice.status, ReceiptStatus::ReadyForPickup);
+        // 6. Verify Signal was received over the broadcast bus
+        let signal = signal_rx.recv().await.expect("Failed to receive signal");
+        assert_eq!(signal.receipt_id, req_id);
+        assert_eq!(signal.agent_id, "AGENT-TEST-42");
+        assert_eq!(signal.status, ReceiptStatus::ReadyForPickup);
 
-        // 7. Pickup outcome with Citizen Token
+        // 7. Pickup outcome with Agent Token
         let final_outcome = engine
-            .pickup_outcome(req_id, &citizen_token)
+            .pickup_outcome(req_id, &agent_token)
             .expect("Pickup failed");
 
         assert_eq!(final_outcome.result["bond_id"], "BOND-9999");
@@ -395,12 +456,12 @@ mod tests {
         let updated_receipt = engine.get_receipt(req_id).unwrap();
         assert_eq!(updated_receipt.status, ReceiptStatus::Fulfilled);
 
-        // 8. Attempting pickup with wrong citizen ID fails
+        // 8. Attempting pickup with wrong agent ID fails
         let wrong_token = engine
-            .issue_citizen_id("CTZ-IMPOSTER", "Aaron Burr", 86400)
+            .issue_agent_token("AGENT-IMPOSTER", "Hostile Agent", 86400)
             .unwrap();
         let impostor_pickup = engine.pickup_outcome(req_id, &wrong_token);
-        assert!(matches!(impostor_pickup, Err(CoreError::CitizenMismatch)));
+        assert!(matches!(impostor_pickup, Err(CoreError::AgentMismatch)));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -410,18 +471,18 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("roviers_vault_test_{}", Uuid::now_v7()));
 
         let req_id;
-        let citizen_token;
+        let agent_token;
 
         // Session 1: Engine starts, creates key, accepts request, completes outcome
         {
             let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
-            citizen_token = engine
-                .issue_citizen_id("CTZ-PERSIST-01", "Ada Lovelace", 86400)
+            agent_token = engine
+                .issue_agent_token("AGENT-PERSIST-01", "Ada Lovelace", 86400)
                 .expect("Failed to issue token");
 
             let request = ServiceRequest::new(
                 "computation.analytic_engine",
-                citizen_token.clone(),
+                agent_token.clone(),
                 serde_json::json!({ "algorithm": "bernoulli_numbers" }),
                 Some("http://127.0.0.1:9999/callback".into()),
             );
@@ -434,7 +495,7 @@ mod tests {
 
             let outcome = ServiceOutcome {
                 receipt_id: req_id,
-                citizen_id: "CTZ-PERSIST-01".into(),
+                agent_id: "AGENT-PERSIST-01".into(),
                 service_name: "computation.analytic_engine".into(),
                 completed_at: Utc::now().timestamp(),
                 result: serde_json::json!({ "status": "COMPUTED", "result_val": 42 }),
@@ -453,7 +514,7 @@ mod tests {
 
             // Outcome should have persisted and be retrievable from Vault with original token
             let outcome = engine2
-                .pickup_outcome(req_id, &citizen_token)
+                .pickup_outcome(req_id, &agent_token)
                 .expect("Failed to pick up outcome from persistent vault");
 
             assert_eq!(outcome.result["result_val"], 42);

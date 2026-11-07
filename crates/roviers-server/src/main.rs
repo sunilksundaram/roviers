@@ -8,7 +8,7 @@ use axum::{
 use clap::Parser;
 use futures::stream::Stream;
 use roviers_core::RoviersEngine;
-use roviers_proto::{Receipt, ServiceOutcome, ServiceRequest, SignedCitizenToken};
+use roviers_proto::{Receipt, ServiceOutcome, ServiceRequest, SignedAgentToken};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -19,7 +19,7 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Roviers: High-throughput Civic Protocol Server")]
+#[command(author, version, about = "Roviers: High-throughput Broker & Outcome Vault Server")]
 struct Args {
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     bind: String,
@@ -34,15 +34,31 @@ struct AppState {
 }
 
 #[derive(Deserialize)]
-struct IssueCitizenRequest {
-    citizen_id: String,
-    full_name: String,
+struct IssueAgentRequest {
+    agent_id: String,
+    #[serde(alias = "full_name", default = "default_agent_name")]
+    agent_name: String,
+    #[serde(default = "default_validity_days")]
     validity_days: i64,
+}
+
+fn default_agent_name() -> String {
+    "Autonomous Agent".to_string()
+}
+
+fn default_validity_days() -> i64 {
+    365
 }
 
 #[derive(Deserialize)]
 struct PickupRequest {
-    citizen_token: SignedCitizenToken,
+    #[serde(alias = "citizen_token")]
+    agent_token: SignedAgentToken,
+}
+
+#[derive(Deserialize)]
+struct CompleteRequest {
+    result: serde_json::Value,
 }
 
 #[tokio::main]
@@ -50,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    tracing::info!("Initializing Roviers engine at {}...", args.data_dir);
+    tracing::info!("Initializing Roviers Broker engine at {}...", args.data_dir);
     let engine = Arc::new(RoviersEngine::new(&args.data_dir)?);
     let state = AppState {
         engine: Arc::clone(&engine),
@@ -61,16 +77,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/api/v1/auth/citizen", post(issue_citizen_token))
+        // Agent Auth
+        .route("/api/v1/auth/agent", post(issue_agent_token))
+        .route("/api/v1/auth/citizen", post(issue_agent_token)) // Backwards compatibility
+        // Service Intake
         .route("/api/v1/services/{service_name}", post(submit_service))
+        // Receipts & Outcome Vault
         .route("/api/v1/receipts/{receipt_id}", get(get_receipt))
         .route("/api/v1/receipts/{receipt_id}/pickup", post(pickup_outcome))
-        .route("/api/v1/citizens/{citizen_id}/stream", get(stream_citizen_intimations))
+        .route("/api/v1/receipts/{receipt_id}/complete", post(complete_receipt))
+        // SSE Real-Time Completion Signals
+        .route("/api/v1/agents/{agent_id}/stream", get(stream_agent_signals))
+        .route("/api/v1/agents/{agent_id}/receipts", get(list_agent_receipts))
+        .route("/api/v1/citizens/{citizen_id}/stream", get(stream_citizen_signals))
         .route("/api/v1/citizens/{citizen_id}/receipts", get(list_citizen_receipts))
         .with_state(state);
 
     let addr: SocketAddr = args.bind.parse()?;
-    tracing::info!("🏛️ Roviers Service Counter listening on http://{}", addr);
+    tracing::info!("🏛️ Roviers Broker listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -79,24 +103,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn health_check() -> &'static str {
-    "Roviers Civic Counter: OK"
+    "Roviers Broker: OK"
 }
 
-/// Endpoint to issue official citizen ID cards (signed by the government key)
-async fn issue_citizen_token(
+/// Endpoint to issue official agent identity credentials (signed by the broker key)
+async fn issue_agent_token(
     State(state): State<AppState>,
-    Json(req): Json<IssueCitizenRequest>,
-) -> Result<Json<SignedCitizenToken>, (StatusCode, String)> {
+    Json(req): Json<IssueAgentRequest>,
+) -> Result<Json<SignedAgentToken>, (StatusCode, String)> {
     let validity_secs = req.validity_days * 86400;
     let token = state
         .engine
-        .issue_citizen_id(&req.citizen_id, &req.full_name, validity_secs)
+        .issue_agent_token(&req.agent_id, &req.agent_name, validity_secs)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(token))
 }
 
-/// Service Counter: Citizen presents ID and request, receives Receipt (HTTP 202 Accepted)
+/// Broker Ingress: Agent presents token and request, receives Receipt (HTTP 202 Accepted)
 async fn submit_service(
     State(state): State<AppState>,
     Path(service_name): Path<String>,
@@ -126,7 +150,7 @@ async fn get_receipt(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// Pickup outcome by presenting the receipt ID and Citizen ID card
+/// Pickup outcome by presenting the receipt ID and Agent token
 async fn pickup_outcome(
     State(state): State<AppState>,
     Path(receipt_id): Path<Uuid>,
@@ -134,10 +158,10 @@ async fn pickup_outcome(
 ) -> Result<Json<ServiceOutcome>, (StatusCode, String)> {
     state
         .engine
-        .pickup_outcome(receipt_id, &req.citizen_token)
+        .pickup_outcome(receipt_id, &req.agent_token)
         .map(Json)
         .map_err(|e| match e {
-            roviers_core::CoreError::Auth(_) | roviers_core::CoreError::CitizenMismatch => {
+            roviers_core::CoreError::Auth(_) | roviers_core::CoreError::AgentMismatch => {
                 (StatusCode::FORBIDDEN, e.to_string())
             }
             roviers_core::CoreError::OutcomeNotReady(_) => {
@@ -148,30 +172,64 @@ async fn pickup_outcome(
         })
 }
 
-/// List all active receipts for a citizen
+/// Worker completion: deposit outcome into the Vault
+async fn complete_receipt(
+    State(state): State<AppState>,
+    Path(receipt_id): Path<Uuid>,
+    Json(req): Json<CompleteRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let receipt = state
+        .engine
+        .get_receipt(receipt_id)
+        .ok_or((StatusCode::NOT_FOUND, format!("Receipt {} not found", receipt_id)))?;
+
+    let outcome = ServiceOutcome {
+        receipt_id,
+        agent_id: receipt.agent_id,
+        service_name: receipt.service_name,
+        completed_at: chrono::Utc::now().timestamp(),
+        result: req.result,
+    };
+
+    state
+        .engine
+        .complete_service(outcome)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+/// List all active receipts for an agent
+async fn list_agent_receipts(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Json<Vec<Receipt>> {
+    let receipts = state.engine.list_agent_receipts(&agent_id);
+    Json(receipts)
+}
+
 async fn list_citizen_receipts(
     State(state): State<AppState>,
     Path(citizen_id): Path<String>,
 ) -> Json<Vec<Receipt>> {
-    let receipts = state.engine.list_citizen_receipts(&citizen_id);
-    Json(receipts)
+    list_agent_receipts(State(state), Path(citizen_id)).await
 }
 
-/// Real-time Server-Sent Events (SSE) intimation channel:
-/// Citizen holds an open lightweight SSE stream to hear back when an outcome is ready.
+/// Real-time Server-Sent Events (SSE) signal channel:
+/// Agent holds an open lightweight SSE stream to hear back when an outcome is ready.
 /// Zero polling, zero heavy sockets on worker servers.
-async fn stream_citizen_intimations(
+async fn stream_agent_signals(
     State(state): State<AppState>,
-    Path(citizen_id): Path<String>,
+    Path(agent_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.engine.subscribe_intimations();
+    let rx = state.engine.subscribe_signals();
     let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let expected_citizen = citizen_id.clone();
+        let expected_agent = agent_id.clone();
         match item {
-            Ok(notice) => {
-                if notice.citizen_id == expected_citizen {
-                    let json = serde_json::to_string(&notice).unwrap_or_default();
-                    Some(Ok(Event::default().event("intimation").data(json)))
+            Ok(signal) => {
+                if signal.agent_id == expected_agent {
+                    let json = serde_json::to_string(&signal).unwrap_or_default();
+                    Some(Ok(Event::default().event("signal").data(json)))
                 } else {
                     None
                 }
@@ -181,6 +239,13 @@ async fn stream_citizen_intimations(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn stream_citizen_signals(
+    State(state): State<AppState>,
+    Path(citizen_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    stream_agent_signals(State(state), Path(citizen_id)).await
 }
 
 /// Background worker simulation:
@@ -209,18 +274,18 @@ fn spawn_worker_pool(engine: Arc<RoviersEngine>) {
                             req.request_id
                         );
 
-                        // Simulate processing time (e.g., identity verification, document generation, HITL)
+                        // Simulate processing time
                         tokio::time::sleep(Duration::from_millis(1500)).await;
 
                         let outcome = ServiceOutcome {
                             receipt_id: req.request_id,
-                            citizen_id: req.citizen_token.credentials.citizen_id.clone(),
+                            agent_id: req.agent_token.credentials.agent_id.clone(),
                             service_name: req.service_name.clone(),
                             completed_at: chrono::Utc::now().timestamp(),
                             result: serde_json::json!({
                                 "status": "APPROVED",
                                 "document_number": format!("DOC-{:X}", rand::random::<u32>()),
-                                "seal": "GOV_OFFICIAL_VERIFIED",
+                                "seal": "BROKER_VERIFIED",
                                 "details": req.payload
                             }),
                         };
@@ -234,4 +299,3 @@ fn spawn_worker_pool(engine: Arc<RoviersEngine>) {
         }
     });
 }
-

@@ -1,68 +1,74 @@
 import {
-  SignedCitizenToken,
+  SignedAgentToken,
   RoviersReceipt,
   RoviersOutcome,
-  IntimationNotice,
+  AgentSignal,
 } from './types';
 
-export interface RoviersClientOptions {
+export interface RoviersBrokerOptions {
   baseUrl?: string;
-  token?: SignedCitizenToken;
+  token?: SignedAgentToken;
   timeoutMs?: number;
 }
 
-export class RoviersClient {
+export class RoviersBrokerClient {
   public readonly baseUrl: string;
-  private token?: SignedCitizenToken;
+  private token?: SignedAgentToken;
   private timeoutMs: number;
 
-  constructor(options: RoviersClientOptions = {}) {
+  constructor(options: RoviersBrokerOptions = {}) {
     this.baseUrl = (options.baseUrl || 'http://127.0.0.1:8080').replace(/\/+$/, '');
     this.token = options.token;
     this.timeoutMs = options.timeoutMs || 10000;
   }
 
-  get citizenId(): string {
+  get agentId(): string {
     if (!this.token) {
-      throw new Error('Client identity token has not been set or issued.');
+      throw new Error('Agent identity token has not been set or issued.');
     }
-    return this.token.credentials.citizen_id;
+    const creds = this.token.credentials as any;
+    return creds.agent_id || creds.citizen_id || creds.client_id;
   }
 
-  setToken(token: SignedCitizenToken): void {
+  setToken(token: SignedAgentToken): void {
     this.token = token;
   }
 
   /**
-   * Request an official signed identity credential from the authority.
+   * Request an official signed identity credential from the Broker.
    */
-  async issueToken(
-    citizenId: string,
-    fullName: string,
+  async issueAgentToken(
+    agentId: string,
+    agentName: string = 'Autonomous Agent',
     validityDays: number = 365
-  ): Promise<SignedCitizenToken> {
-    const res = await fetch(`${this.baseUrl}/api/v1/auth/citizen`, {
+  ): Promise<SignedAgentToken> {
+    const res = await fetch(`${this.baseUrl}/api/v1/auth/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        citizen_id: citizenId,
-        full_name: fullName,
+        agent_id: agentId,
+        agent_name: agentName,
         validity_days: validityDays,
       }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 
     if (!res.ok) {
-      throw new Error(`Failed to issue token: ${res.status} ${await res.text()}`);
+      throw new Error(`Failed to issue agent token: ${res.status} ${await res.text()}`);
     }
 
-    const token = (await res.json()) as SignedCitizenToken;
+    const token = (await res.json()) as SignedAgentToken;
     this.token = token;
     return token;
   }
 
+  // Backwards compatibility alias
+  async issueToken(agentId: string, name: string = 'Agent', validityDays: number = 365): Promise<SignedAgentToken> {
+    return this.issueAgentToken(agentId, name, validityDays);
+  }
+
   /**
-   * Submit an asynchronous service request.
+   * Submit an asynchronous service request to the Broker ingress.
    * Immediately returns HTTP 202 with Claim-Check Receipt.
    */
   async submit<T = any>(
@@ -71,7 +77,7 @@ export class RoviersClient {
     callbackUrl?: string
   ): Promise<RoviersReceipt> {
     if (!this.token) {
-      throw new Error('A valid SignedCitizenToken is required before submitting requests.');
+      throw new Error('A valid SignedAgentToken is required before submitting requests.');
     }
 
     const res = await fetch(`${this.baseUrl}/api/v1/services/${serviceName}`, {
@@ -79,7 +85,7 @@ export class RoviersClient {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         service_name: serviceName,
-        citizen_token: this.token,
+        agent_token: this.token,
         payload,
         callback_url: callbackUrl || null,
       }),
@@ -110,23 +116,23 @@ export class RoviersClient {
   }
 
   /**
-   * Present receipt ID and identity token to collect final outcome from Vault.
-   * Returns null if still in process (HTTP 202).
+   * Present receipt ID and agent token to collect final outcome from the Broker Vault.
+   * Returns null if still being computed (HTTP 202).
    */
   async pickup<T = any>(receiptId: string): Promise<RoviersOutcome<T> | null> {
     if (!this.token) {
-      throw new Error('A valid SignedCitizenToken is required to pickup outcomes.');
+      throw new Error('A valid SignedAgentToken is required to pickup outcomes.');
     }
 
     const res = await fetch(`${this.baseUrl}/api/v1/receipts/${receiptId}/pickup`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ citizen_token: this.token }),
+      body: JSON.stringify({ agent_token: this.token }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 
     if (res.status === 202) {
-      return null; // Outcome still being computed
+      return null;
     }
 
     if (!res.ok) {
@@ -137,7 +143,23 @@ export class RoviersClient {
   }
 
   /**
-   * Waits for a task outcome using non-blocking SSE intimations, then claims from the Vault.
+   * Worker method: deposit finished task outcome into the Broker Vault.
+   */
+  async complete<T = any>(receiptId: string, result: T): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/v1/receipts/${receiptId}/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Complete failed: ${res.status} ${await res.text()}`);
+    }
+  }
+
+  /**
+   * Waits for a task outcome using non-blocking SSE signals, then claims from the Vault.
    */
   async waitForOutcome<T = any>(
     receiptId: string,
@@ -154,7 +176,7 @@ export class RoviersClient {
         reject(new Error(`Timed out waiting for receipt #${receiptId} after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      const url = `${this.baseUrl}/api/v1/citizens/${this.citizenId}/stream`;
+      const url = `${this.baseUrl}/api/v1/agents/${this.agentId}/stream`;
       const controller = new AbortController();
 
       fetch(url, { signal: controller.signal })
@@ -179,8 +201,8 @@ export class RoviersClient {
             for (const line of lines) {
               if (line.startsWith('data:')) {
                 try {
-                  const notice: IntimationNotice = JSON.parse(line.slice(5).trim());
-                  if (notice.receipt_id === receiptId) {
+                  const signal: AgentSignal = JSON.parse(line.slice(5).trim());
+                  if (signal.receipt_id === receiptId) {
                     controller.abort();
                     clearTimeout(timer);
 
@@ -205,3 +227,6 @@ export class RoviersClient {
     });
   }
 }
+
+// Backwards compatibility alias
+export const RoviersClient = RoviersBrokerClient;

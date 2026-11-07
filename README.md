@@ -1,31 +1,31 @@
 # Roviers 🏛️
 
-> **High-Throughput Asynchronous Service Intake & Claim-Check Vault Engine in Rust**  
-> *Stateless Authentication • Memory-Mapped Append-Only Ledger • Claim-Check Receipts • Decoupled Outcome Vault • Zero-Polling Event Intimations*
+> **High-Throughput Task Broker & Claim-Check Vault Engine in Rust**  
+> *Stateless Agent Authentication • Memory-Mapped Append-Only Ledger • Claim-Check Receipts • Persistent Outcome Vault • Zero-Polling Real-Time Signals & Webhooks*
 
 ---
 
 ## 💡 Overview
 
-Modern distributed environments—especially those orchestrating **AI agents, LLM pipelines, autonomous workflows, microservices, and web/app clusters**—frequently face critical architectural bottlenecks:
-- **Connection Exhaustion:** Holding synchronous HTTP/gRPC sockets open while waiting for long-running AI inference, complex multi-step reasoning, external APIs, or human-in-the-loop decisions causes gateway timeouts and thread starvation.
-- **Aggressive Client Polling:** Hundreds or thousands of clients constantly spamming status endpoints degrades database performance and wastes network bandwidth.
-- **Tight Coupling & Lost State:** Transient client disconnections during execution often result in lost results or redundant, expensive re-executions.
+Modern distributed environments—especially those orchestrating **AI agents, LLM pipelines, autonomous workflows, microservices, and web clusters**—frequently face critical architectural bottlenecks:
+- **Connection Exhaustion:** Holding synchronous HTTP/gRPC sockets open while waiting for long-running AI inference, multi-step agent reasoning, external APIs, or human-in-the-loop decisions causes gateway timeouts and thread starvation.
+- **Aggressive Client Polling:** Hundreds or thousands of clients constantly hammering status endpoints degrades database performance and wastes network bandwidth.
+- **Tight Coupling & Lost State:** Transient agent disconnections during execution often result in lost results or redundant, expensive re-executions.
 
-**Roviers** solves this by decoupling request intake from service execution through a high-performance **Claim-Check Receipt & Vault architecture**:
+**Roviers** solves this by decoupling request intake from service execution through a high-performance **Broker & Agent Claim-Check Architecture**:
 
-```
+```text
  ┌────────────────────────────────────────────────────────┐
- │                   CONCURRENT CLIENTS                   │
- │   [App Servers]  [Web Clusters]  [AI Orchestrators]    │
- │   [Autonomous AI Agents]         [Background Jobs]     │
+ │                   DISTRIBUTED AGENTS                   │
+ │   [AI Agents]    [LLM Orchestrators]   [App Servers]   │
+ │   [Web Clusters] [Background Workers]  [RAG Pipelines] │
  └─────────────────────────┬──────────────────────────────┘
                            │
-             1. Submit Request with Stateless ID
-             2. Receive Instant Claim-Check Receipt
+             1. Submit Task with Stateless Agent Token
+             2. Receive Instant Claim-Check Receipt (~2ms)
                            ▼
  ┌────────────────────────────────────────────────────────┐
- │               ROVIERS INGRESS COUNTER                  │
+ │                 ROVIERS BROKER INGRESS                 │
  │   • Sub-microsecond Ed25519 Stateless Verification    │
  │   • Sliding-Window Idempotency Deduplication           │
  │   • Fast Append to MMap Ledger (memmap2 + CRC32 + LZ4) │
@@ -33,44 +33,45 @@ Modern distributed environments—especially those orchestrating **AI agents, LL
  └─────────────┬────────────────────────────▲─────────────┘
                │                            │
    3. Topic Trie Dispatch          6. Authenticated Outcome Pickup
-               │                      (Present ID + Receipt)
+               │                      (Present Token + Receipt)
                ▼                            │
  ┌───────────────────────────┐   ┌──────────┴─────────────┐
- │       WORKER MESH         │   │     OUTCOME VAULT      │
- │  • App / Web Services     │   │  • Persistent Results  │
- │  • LLM & Vision Agents    │──►│  • Audit Trail         │
- │  • Human-in-the-Loop      │ 4.│  • Secure Isolation    │
+ │       WORKER MESH         │   │      BROKER VAULT      │
+ │  • LLM & Vision Workers   │   │  • Persistent Outcomes │
+ │  • App & Web Services     │──►│  • Audit Trail         │
+ │  • Human-in-the-Loop      │ 4.│  • Disk-Backed Storage │
  │  • Batch Processors       │ Store                      │
  └─────────────┬─────────────┘ Outcome                    │
                │                                          │
-               └─────────► 5. Intimation Bus (SSE) ───────┘
-                           "Receipt #UUID ready"
+               └─────────► 5. Signal Bus (SSE / Webhook) ─┘
+                           "Receipt #UUID ready in Vault"
 ```
 
 ---
 
 ## 🔑 Core Concepts
 
-### 1. Many Concurrent Clients ➡️ Single or Many Services
-- **Clients:** App servers, web applications, autonomous AI agents, multi-agent orchestrators (e.g., LangGraph, AutoGen, CrewAI), and enterprise systems submit service requests concurrently.
-- **Services:** Downstream workers can be heterogeneous—a simple database lookup, a distributed map-reduce job, an autonomous research agent, or a slow human approval queue.
+### 1. Broker & Agent Paradigm
+- **Broker (`roviers-server`):** The central high-throughput coordination engine, immutable ledger host, and outcome vault.
+- **Agent:** Any requesting entity or background processor—autonomous AI agents (LangGraph, CrewAI, AutoGen), web servers, or indexing workers.
 
 ### 2. Instant Claim-Check Receipts (Non-Blocking Ingress)
-- Clients present an **Ed25519-signed identity credential** alongside their service payload.
-- The ingress verifies identity **in sub-microseconds without database roundtrips**, enforces idempotency deduplication, commits the entry to an append-only log, and immediately returns an immutable **Claim-Check Receipt Token** (`UUIDv7`).
-- The client connection terminates immediately, completely eliminating socket holding and gateway timeouts.
+- Agents present an **Ed25519-signed agent credential** alongside their task payload.
+- The Broker verifies identity **in sub-microseconds without database roundtrips**, enforces idempotency deduplication, commits the entry to an append-only memory-mapped log, and immediately returns an immutable **Claim-Check Receipt Token** (`UUIDv7`).
+- The agent connection closes immediately (~2ms), completely eliminating socket holding and gateway timeouts.
 
-### 3. Decoupled Outcome Vault & Secure Retrieval
-- Once workers complete processing (seconds, hours, or days later), the structured execution result is deposited into the **Outcome Vault**.
-- At any later point, the client (or an authorized downstream service) authenticates and presents the **Receipt Token** to fetch the result.
-- Outcomes remain tamper-proof and isolated to the authenticated receipt owner.
+### 3. Persistent Outcome Vault & Secure Retrieval
+- Once workers complete processing (seconds, hours, or days later), the structured execution result is deposited into the **Broker Vault**.
+- At any later point, the agent authenticates and presents the **Receipt Token** to fetch the verified outcome.
+- Outcomes remain tamper-proof, crash-safe, and isolated to the authenticated agent.
 
-### 4. Zero-Polling Intimation Bus
-- Instead of hammering the server with polling loops, clients or orchestrators subscribe to an ultra-lightweight **Server-Sent Events (SSE)** intimation stream.
-- The moment the outcome lands in the vault, an **Intimation Notice** is broadcast: *"Receipt #UUID is ready for pickup at `/api/v1/receipts/{id}/pickup`"*.
+### 4. Zero-Polling Signals & Active Webhooks
+- Instead of hammering the server with polling loops, agents subscribe to an ultra-lightweight **Server-Sent Events (SSE)** signal stream (`/api/v1/agents/{id}/stream`).
+- The moment the outcome lands in the vault, an **AgentSignal** is pushed to the agent.
+- Tasks can also specify a `callback_url` for automatic, active webhook delivery.
 
 ### 5. High-Throughput Append-Only Engine
-- Built with memory-mapped segments (`memmap2`), hardware-accelerated integrity verification (`crc32fast`), zero-copy serialization, and real-time block compression (`lz4_flex`).
+- Built with memory-mapped log segments (`memmap2`), hardware-accelerated integrity verification (`crc32fast`), zero-copy serialization, and real-time block compression (`lz4_flex`).
 
 ---
 
@@ -82,11 +83,11 @@ roviers/
 ├── Dockerfile                  # Multi-stage production container build
 ├── docker-compose.yml          # Containerized turnkey deployment
 ├── crates/
-│   ├── roviers-proto/          # Cryptographic IDs, Claim-Check Receipts, Outcomes, Envelopes
+│   ├── roviers-proto/          # Cryptographic Agent Tokens, Receipts, Outcomes, Signals
 │   ├── roviers-ledger/         # Memory-mapped append-only storage, Radix Topic Trie, Dedup log
-│   ├── roviers-core/           # Engine coordinating Auth, Ingress, Vault, Webhooks, and Intimations
-│   ├── roviers-server/         # Axum HTTP/SSE Service Counter & simulated background workers
-│   └── roviers-cli/            # CLI for issuing IDs, submitting requests, & real-time pickup
+│   ├── roviers-core/           # Engine coordinating Broker Ingress, Vault, Webhooks, and Signals
+│   ├── roviers-server/         # Axum HTTP/SSE Broker Server & background worker pool
+│   └── roviers-cli/            # CLI for issuing tokens, submitting tasks, listening, & pickup
 ├── clients/
 │   ├── python/                 # Python SDK (httpx async client + LangGraph/CrewAI tool wrapper)
 │   └── typescript/             # TypeScript SDK (universal fetch-based client for Node & Web)
@@ -110,7 +111,7 @@ cargo test
 cargo bench -p roviers-core
 ```
 
-### 3. Start the Server (Local or Docker)
+### 3. Start the Roviers Broker (Local or Docker)
 
 **Local Cargo:**
 ```bash
@@ -130,59 +131,68 @@ cargo run -p roviers-cli -- demo
 
 **Demo Execution Output:**
 ```text
-1️⃣ [CLIENT AUTH] Issued verified identity token for: Eleanor Vance (CTZ-2026-DEMO-01)
-2️⃣ [CLAIM-CHECK] Ingress accepted request!
+1️⃣ [AGENT TOKEN] Issued verified token for: Autonomous Research Agent (AGENT-2026-DEMO-01)
+2️⃣ [RECEIPT TOKEN] Broker accepted request!
    Issued Receipt: #019318b2-5f60-7a0e-bc48-bf5b94fefdb9 (Status: Queued)
-3️⃣ [ASYNC EXECUTION] Worker pool processing asynchronously in background...
-4️⃣ [VAULT RETRIEVAL] Client presented Receipt + Auth and retrieved outcome from Vault:
+3️⃣ [ASYNC WORK] Worker pool processing in background... (Waiting for worker completion)
+4️⃣ [OUTCOME PICKUP] Agent presented receipt and collected final outcome from Vault:
 {
   "document_number": "DOC-A8F21B",
-  "seal": "GOV_OFFICIAL_VERIFIED",
+  "seal": "BROKER_VERIFIED",
   "status": "APPROVED",
   "details": {
-    "applicant_notes": "Official certified copy"
+    "document_id": "DOC-9912",
+    "priority": "high"
   }
 }
 
-✨ End-to-end flow verified: non-blocking ingress, zero-polling intimation, and secure vault retrieval!
+✨ Full end-to-end flow verified: non-blocking Broker ingress, async execution, and Vault redemption!
 ```
 
 ---
 
-## 🛠️ Step-by-Step Walkthrough
+## 🛠️ Step-by-Step CLI Walkthrough
 
-### Step 1: Issue a Stateless Client Credential
-Generate an Ed25519-signed identity credential for a client (app server, agent, or service account):
+### Step 1: Issue a Stateless Agent Token
+Generate an Ed25519-signed identity credential for an agent (AI agent, app server, or service account):
 ```bash
-cargo run -p roviers-cli -- issue-citizen \
-  --id "CLIENT-AGENT-007" \
+cargo run -p roviers-cli -- issue-agent \
+  --id "AGENT-RESEARCHER-01" \
   --name "Autonomous Research Agent" \
   --validity-days 365 \
-  --out agent_id.json
+  --out agent_token.json
 ```
 
-### Step 2: Subscribe to Real-Time Intimations (Optional / Zero-Polling)
+### Step 2: Subscribe to Real-Time Signals (Zero-Polling SSE)
 Connect an event listener over SSE to get notified the instant tasks complete:
 ```bash
-cargo run -p roviers-cli -- listen --citizen-id "CLIENT-AGENT-007"
+cargo run -p roviers-cli -- listen --agent-id "AGENT-RESEARCHER-01"
 ```
 
 ### Step 3: Dispatch Asynchronous Service Request
-Submit a heavy or multi-step service request. Roviers validates the token, appends the request to the ledger, and returns a Receipt Token immediately:
+Submit a heavy or multi-step service request. The Broker validates the token, appends the request to the ledger, and returns a Receipt Token immediately (~2ms):
 ```bash
 cargo run -p roviers-cli -- submit \
   --service "ai.inference.document_analysis" \
-  --token-file agent_id.json \
+  --token-file agent_token.json \
   --data '{"model": "deep-reasoning", "document_id": "doc_99182"}'
 ```
 *Response contains the unique Receipt UUID, e.g. `019318b2-5f60-7a0e-bc48-bf5b94fefdb9`.*
 
-### Step 4: Retrieve Results from the Vault
-Whenever convenient (immediately upon receiving an intimation or hours later), retrieve the finished artifact from the secure storage vault:
+### Step 4: Worker Deposits Finished Outcome (Optional / Remote Worker)
+External workers or AI execution nodes can complete tasks and deposit results into the Vault:
+```bash
+cargo run -p roviers-cli -- complete \
+  --receipt "019318b2-5f60-7a0e-bc48-bf5b94fefdb9" \
+  --data '{"summary": "Document successfully analyzed", "findings": 42}'
+```
+
+### Step 5: Retrieve Results from the Broker Vault
+Whenever convenient (immediately upon receiving an SSE signal or hours later), retrieve the finished artifact from the secure storage vault:
 ```bash
 cargo run -p roviers-cli -- pickup \
   --receipt "019318b2-5f60-7a0e-bc48-bf5b94fefdb9" \
-  --token-file agent_id.json
+  --token-file agent_token.json
 ```
 
 ---
@@ -194,30 +204,30 @@ Roviers includes first-party, lightweight SDKs designed for zero-polling async w
 ### Python Client SDK (`clients/python`)
 Designed for **AI Agents, LangGraph, CrewAI, AutoGen, and FastAPI**:
 ```python
-from roviers import RoviersClient, RoviersTool
+from roviers import RoviersBrokerClient, RoviersTool
 
-client = RoviersClient(base_url="http://127.0.0.1:8080", token="agent_token.json")
+broker = RoviersBrokerClient(base_url="http://127.0.0.1:8080", token="agent_token.json")
 
 # 1. Non-blocking dispatch (< 5ms)
-receipt = await client.submit("service.ai.deep_analysis", {"query": "Analyze market shift"})
+receipt = await broker.submit("service.ai.deep_analysis", {"query": "Analyze market shift"})
 
-# 2. Wait for zero-polling SSE intimation and automatically redeem from Vault
-outcome = await client.wait_for_outcome(receipt.receipt_id)
-print("Vault Outcome:", outcome.result)
+# 2. Wait for zero-polling SSE signal and automatically redeem from Vault
+outcome = await broker.wait_for_outcome(receipt.receipt_id)
+print("Broker Vault Outcome:", outcome.result)
 ```
 
 ### TypeScript / Node.js Client SDK (`clients/typescript`)
 Universal fetch-based client for **Next.js, Express, Fastify, and browser apps**:
 ```typescript
-import { RoviersClient } from 'roviers';
+import { RoviersBrokerClient } from 'roviers';
 
-const client = new RoviersClient({ baseUrl: 'http://127.0.0.1:8080' });
-await client.issueToken('CLIENT-WEB-01', 'Production Web Cluster');
+const broker = new RoviersBrokerClient({ baseUrl: 'http://127.0.0.1:8080' });
+await broker.issueAgentToken('AGENT-WEB-01', 'Production Web Agent');
 
 // Submit asynchronous job and await vault completion via SSE
-const receipt = await client.submit('service.reports.monthly_reconcile', { month: '2026-11' });
-const outcome = await client.waitForOutcome(receipt.receipt_id);
-console.log('Outcome:', outcome.result);
+const receipt = await broker.submit('service.reports.monthly_reconcile', { month: '2026-11' });
+const outcome = await broker.waitForOutcome(receipt.receipt_id);
+console.log('Outcome from Vault:', outcome.result);
 ```
 
 ---
@@ -226,13 +236,14 @@ console.log('Outcome:', outcome.result);
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `GET`  | `/health` | Server liveness and readiness health check |
-| `POST` | `/api/v1/auth/citizen` | Issue an Ed25519-signed client identity credential |
-| `POST` | `/api/v1/services/{service_name}` | Submit service request; returns HTTP 202 + Claim-Check Receipt |
+| `GET`  | `/health` | Broker health & readiness check |
+| `POST` | `/api/v1/auth/agent` | Issue an Ed25519-signed Agent identity token |
+| `POST` | `/api/v1/services/{service_name}` | Agent submits task; returns HTTP 202 + Claim-Check Receipt |
 | `GET`  | `/api/v1/receipts/{receipt_id}` | Inspect current receipt status (`Queued`, `Processing`, `ReadyForPickup`) |
-| `POST` | `/api/v1/receipts/{receipt_id}/pickup` | Authenticate with client token and retrieve final outcome from Vault |
-| `GET`  | `/api/v1/citizens/{citizen_id}/stream` | Stream real-time SSE completion notices filtered by client identity |
-| `GET`  | `/api/v1/citizens/{citizen_id}/receipts` | List all active receipts for a client identity |
+| `POST` | `/api/v1/receipts/{receipt_id}/pickup` | Authenticate with agent token and retrieve outcome from Vault |
+| `POST` | `/api/v1/receipts/{receipt_id}/complete` | Worker deposits completed execution result into Vault |
+| `GET`  | `/api/v1/agents/{agent_id}/stream` | Stream real-time SSE completion signals filtered by agent identity |
+| `GET`  | `/api/v1/agents/{agent_id}/receipts` | List all active receipts for an agent identity |
 
 ---
 
@@ -251,4 +262,3 @@ Explore the comprehensive operational guides:
 
 ## 📄 License
 MIT License. Created by Sunil K Sundaram.
-

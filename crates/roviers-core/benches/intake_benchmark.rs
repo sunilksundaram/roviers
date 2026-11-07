@@ -7,12 +7,12 @@ fn bench_token_verification(c: &mut Criterion) {
     let temp_dir = std::env::temp_dir().join(format!("roviers_bench_verify_{}", Uuid::now_v7()));
     let engine = RoviersEngine::new(&temp_dir).unwrap();
     let token = engine
-        .issue_citizen_id("CTZ-BENCH-01", "Bench Citizen", 86400)
+        .issue_agent_token("AGENT-BENCH-01", "Bench Agent", 86400)
         .unwrap();
 
     c.bench_function("stateless_ed25519_token_verification", |b| {
         b.iter(|| {
-            let res = token.verify(&engine.gov_verifying_key).unwrap();
+            let res = token.verify(&engine.broker_verifying_key).unwrap();
             black_box(res);
         })
     });
@@ -29,7 +29,7 @@ fn bench_request_intake(c: &mut Criterion) {
     let temp_dir = std::env::temp_dir().join(format!("roviers_bench_intake_{}", Uuid::now_v7()));
     let engine = RoviersEngine::new(&temp_dir).unwrap();
     let token = engine
-        .issue_citizen_id("CTZ-BENCH-02", "Bench Submitter", 86400)
+        .issue_agent_token("AGENT-BENCH-02", "Bench Submitter Agent", 86400)
         .unwrap();
 
     let mut group = c.benchmark_group("engine_intake");
@@ -67,7 +67,7 @@ fn bench_vault_redemption(c: &mut Criterion) {
     let temp_dir = std::env::temp_dir().join(format!("roviers_bench_vault_{}", Uuid::now_v7()));
     let engine = RoviersEngine::new(&temp_dir).unwrap();
     let token = engine
-        .issue_citizen_id("CTZ-BENCH-03", "Vault Collector", 86400)
+        .issue_agent_token("AGENT-BENCH-03", "Vault Collector Agent", 86400)
         .unwrap();
 
     // Pre-populate 500 completed outcomes in the vault
@@ -86,7 +86,7 @@ fn bench_vault_redemption(c: &mut Criterion) {
 
             let outcome = ServiceOutcome {
                 receipt_id: req_id,
-                citizen_id: "CTZ-BENCH-03".into(),
+                agent_id: "AGENT-BENCH-03".into(),
                 service_name: "bench.storage.fetch".into(),
                 completed_at: chrono::Utc::now().timestamp(),
                 result: serde_json::json!({ "computed_hash": "a8f3b299e120" }),

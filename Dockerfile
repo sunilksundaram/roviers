@@ -24,3 +24,4 @@ HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
 
 ENTRYPOINT ["/usr/local/bin/roviers-server"]
 CMD ["--bind", "0.0.0.0:8080", "--data-dir", "/var/lib/roviers"]
+

@@ -160,7 +160,7 @@ sudo chmod 750 /var/lib/roviers
 ### 2. Create Systemd Unit (`/etc/systemd/system/roviers.service`)
 ```ini
 [Unit]
-Description=Roviers Civic Service Intake and Outcome Vault
+Description=Roviers Task Broker & Claim-Check Vault
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -231,14 +231,14 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # CRITICAL: SSE Intimation Stream configuration
-    location ~* /api/v1/citizens/.+/stream {
+    # CRITICAL: SSE Signal Stream configuration
+    location ~* /api/v1/agents/.+/stream {
         proxy_pass http://roviers_backend;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;
 
-        # Disable buffering so events stream immediately to clients
+        # Disable buffering so signals stream immediately to agents
         proxy_buffering off;
         proxy_cache off;
         chunked_transfer_encoding off;
@@ -327,7 +327,7 @@ To restore a node, restore the log segment files into the designated data direct
 
 ### Liveness & Readiness Probes
 - **Endpoint:** `GET /health`
-- **Expected Return:** HTTP `200 OK` with payload `"Roviers Civic Counter: OK"`
+- **Expected Return:** HTTP `200 OK` with payload `"Roviers Broker: OK"`
 
 Kubernetes Pod spec snippet:
 ```yaml
