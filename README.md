@@ -170,13 +170,29 @@ cargo run -p roviers-cli -- pickup \
 
 | Method | Endpoint | Description |
 |:-------|:---------|:------------|
-| `POST` | `/api/v1/auth/issue` | Issue a signed client identity credential |
-| `POST` | `/api/v1/services/submit` | Submit service request; returns HTTP 202 + Claim-Check Receipt |
-| `GET`  | `/api/v1/receipts/{id}` | Inspect current receipt status (`Queued`, `Processing`, `ReadyForPickup`) |
-| `POST` | `/api/v1/receipts/{id}/pickup` | Authenticate with client token and retrieve final outcome from Vault |
-| `GET`  | `/api/v1/intimations/events` | Stream real-time SSE completion notices filtered by client identity |
+| `GET`  | `/health` | Server liveness and readiness health check |
+| `POST` | `/api/v1/auth/citizen` | Issue an Ed25519-signed client identity credential |
+| `POST` | `/api/v1/services/{service_name}` | Submit service request; returns HTTP 202 + Claim-Check Receipt |
+| `GET`  | `/api/v1/receipts/{receipt_id}` | Inspect current receipt status (`Queued`, `Processing`, `ReadyForPickup`) |
+| `POST` | `/api/v1/receipts/{receipt_id}/pickup` | Authenticate with client token and retrieve final outcome from Vault |
+| `GET`  | `/api/v1/citizens/{citizen_id}/stream` | Stream real-time SSE completion notices filtered by client identity |
+| `GET`  | `/api/v1/citizens/{citizen_id}/receipts` | List all active receipts for a client identity |
+
+---
+
+## 📚 In-Depth Guides & Documentation
+
+Explore the comprehensive operational guides:
+
+- 📖 **[Server Deployment & Operations Guide](docs/DEPLOYMENT_GUIDE.md)**: Production setup, systemd units, Docker & Docker Compose, Nginx/Caddy SSE reverse proxying, kernel sysctl tuning, and storage backup strategies.
+- 📊 **[Benchmarks & Capacity Sizing Guide](docs/BENCHMARKS_AND_SIZING.md)**: Empirical throughput (150,000+ req/s), latency percentiles (p95 < 750 µs), 100,000-connection SSE streaming capacity on standard cloud VMs, and client socket duration reduction metrics.
+- 🧩 **[Client Integration & User Guide](docs/INTEGRATION_GUIDE.md)**: Real-world sample implementations with copy-pasteable code for:
+  - **AI Agents & Multi-Agent Orchestrators** (Python async agent loop)
+  - **RAG Ingestion Pipelines** (FastAPI / LlamaIndex background vector indexing)
+  - **Standard Web Applications** (Node.js / TypeScript Express report generator)
 
 ---
 
 ## 📄 License
 MIT License. Created by Sunil K Sundaram.
+
