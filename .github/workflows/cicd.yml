@@ -105,3 +105,4 @@ jobs:
           cd clients/typescript
           npm install
           npm run build
+

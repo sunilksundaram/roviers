@@ -112,3 +112,4 @@ def run_server(args: list[str] | None = None) -> None:
         subprocess.run(cmd)
     except KeyboardInterrupt:
         pass
+
