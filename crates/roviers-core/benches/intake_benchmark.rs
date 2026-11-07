@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use roviers_core::RoviersEngine;
 use roviers_proto::{ServiceOutcome, ServiceRequest};
 use uuid::Uuid;

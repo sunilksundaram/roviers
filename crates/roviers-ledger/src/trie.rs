@@ -38,9 +38,14 @@ impl TopicTrie {
         let mut node = &mut *current;
         for segment in segments {
             if segment == "*" {
-                node = node.wildcard_child.get_or_insert_with(|| Box::new(TrieNode::new()));
+                node = node
+                    .wildcard_child
+                    .get_or_insert_with(|| Box::new(TrieNode::new()));
             } else {
-                node = node.children.entry(segment.to_string()).or_insert_with(TrieNode::new);
+                node = node
+                    .children
+                    .entry(segment.to_string())
+                    .or_insert_with(TrieNode::new);
             }
         }
 
@@ -104,4 +109,3 @@ mod tests {
         assert_eq!(rx_wild.recv().await.unwrap(), 42);
     }
 }
-

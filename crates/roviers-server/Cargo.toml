@@ -11,6 +11,7 @@ roviers-ledger = { path = "../roviers-ledger" }
 roviers-core = { path = "../roviers-core" }
 tokio.workspace = true
 axum.workspace = true
+tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,4 +25,9 @@ futures.workspace = true
 ed25519-dalek.workspace = true
 clap.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true }
+http = "1.0"
+http-body-util = "0.1"
 

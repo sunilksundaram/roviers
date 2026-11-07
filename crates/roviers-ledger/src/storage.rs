@@ -60,7 +60,7 @@ impl Ledger {
         let mut entries = fs::read_dir(&dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "log"))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
             .collect::<Vec<_>>();
 
         entries.sort();
@@ -72,17 +72,19 @@ impl Ledger {
         for path in &entries {
             let metadata = fs::metadata(path)?;
             let file_size = metadata.len();
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(base) = stem.parse::<u64>() {
-                    segments.push(SegmentInfo {
-                        base_offset: base,
-                        end_offset: base + file_size,
-                        path: path.clone(),
-                    });
-                    active_base = base;
-                    active_size = file_size;
-                    next_offset = base + file_size;
-                }
+            let parsed = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok());
+            if let Some(base) = parsed {
+                segments.push(SegmentInfo {
+                    base_offset: base,
+                    end_offset: base + file_size,
+                    path: path.clone(),
+                });
+                active_base = base;
+                active_size = file_size;
+                next_offset = base + file_size;
             }
         }
 
@@ -134,7 +136,9 @@ impl Ledger {
             self.roll_segment()?;
         }
 
-        let record_offset = self.next_offset.fetch_add(total_record_len as u64, Ordering::SeqCst);
+        let record_offset = self
+            .next_offset
+            .fetch_add(total_record_len as u64, Ordering::SeqCst);
         let timestamp = chrono::Utc::now().timestamp_millis();
 
         // Calculate CRC32 of payload and metadata
@@ -212,12 +216,20 @@ impl Ledger {
 
     pub fn read_record(&mut self, target_offset: u64) -> Result<Option<LedgerRecord>, LedgerError> {
         // Find segment containing this offset
-        let segment = match self.segments.iter().find(|s| target_offset >= s.base_offset && target_offset < s.end_offset) {
+        let segment = match self
+            .segments
+            .iter()
+            .find(|s| target_offset >= s.base_offset && target_offset < s.end_offset)
+        {
             Some(s) => s,
             None => {
                 // If not found, try reloading mmaps in case new writes occurred
                 self.reload_mmaps()?;
-                match self.segments.iter().find(|s| target_offset >= s.base_offset && target_offset < s.end_offset) {
+                match self
+                    .segments
+                    .iter()
+                    .find(|s| target_offset >= s.base_offset && target_offset < s.end_offset)
+                {
                     Some(s) => s,
                     None => return Ok(None),
                 }
@@ -284,4 +296,3 @@ impl Ledger {
         }))
     }
 }
-

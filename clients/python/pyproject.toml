@@ -16,6 +16,10 @@ dependencies = [
     "httpx>=0.25.0",
 ]
 
+[project.scripts]
+roviers = "roviers.cli:main"
+roviers-server = "roviers.installer:run_server"
+
 [project.optional-dependencies]
 agents = [
     "langchain-core>=0.2.0",

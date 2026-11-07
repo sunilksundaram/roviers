@@ -141,8 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("   Agent ID:     {}", receipt.agent_id);
             println!("   Service:      {}", receipt.service_name);
             println!("   Status:       {:?}", receipt.status);
-            println!("   Est. Ready:   {:?} seconds", receipt.estimated_ready_secs);
-            println!("\n💡 Connection freed. You will receive an SSE Signal or Webhook when ready.");
+            println!(
+                "   Est. Ready:   {:?} seconds",
+                receipt.estimated_ready_secs
+            );
+            println!(
+                "\n💡 Connection freed. You will receive an SSE Signal or Webhook when ready."
+            );
         }
 
         Commands::Status { receipt } => {
@@ -164,12 +169,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Complete { receipt, data } => {
-            let result_val: serde_json::Value = serde_json::from_str(&data)
-                .map_err(|e| format!("Invalid JSON data: {}", e))?;
+            let result_val: serde_json::Value =
+                serde_json::from_str(&data).map_err(|e| format!("Invalid JSON data: {}", e))?;
 
-            println!("👷 Worker depositing outcome into Broker Vault for receipt #{}...", receipt);
+            println!(
+                "👷 Worker depositing outcome into Broker Vault for receipt #{}...",
+                receipt
+            );
             let res = client
-                .post(format!("{}/api/v1/receipts/{}/complete", cli.server, receipt))
+                .post(format!(
+                    "{}/api/v1/receipts/{}/complete",
+                    cli.server, receipt
+                ))
                 .json(&serde_json::json!({ "result": result_val }))
                 .send()
                 .await?;
@@ -213,7 +224,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Listen { agent_id } => {
-            println!("👂 Listening for real-time signals for agent '{}' (SSE)...", agent_id);
+            println!(
+                "👂 Listening for real-time signals for agent '{}' (SSE)...",
+                agent_id
+            );
             let mut res = client
                 .get(format!("{}/api/v1/agents/{}/stream", cli.server, agent_id))
                 .send()
@@ -241,7 +255,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
 
             let token: SignedAgentToken = issue_res.json().await?;
-            println!("1️⃣ [AGENT TOKEN] Issued verified token for: {} ({})", token.credentials.agent_name, token.credentials.agent_id);
+            println!(
+                "1️⃣ [AGENT TOKEN] Issued verified token for: {} ({})",
+                token.credentials.agent_name, token.credentials.agent_id
+            );
 
             // 2. Submit Request
             let req = ServiceRequest::new(
@@ -252,30 +269,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let submit_res = client
-                .post(format!("{}/api/v1/services/ai.document_analysis", cli.server))
+                .post(format!(
+                    "{}/api/v1/services/ai.document_analysis",
+                    cli.server
+                ))
                 .json(&req)
                 .send()
                 .await?;
 
             let receipt: Receipt = submit_res.json().await?;
             println!("2️⃣ [RECEIPT TOKEN] Broker accepted request!");
-            println!("   Issued Receipt: #{} (Status: {:?})", receipt.receipt_id, receipt.status);
-            println!("3️⃣ [ASYNC WORK] Worker pool processing in background... (Waiting for worker completion)");
+            println!(
+                "   Issued Receipt: #{} (Status: {:?})",
+                receipt.receipt_id, receipt.status
+            );
+            println!(
+                "3️⃣ [ASYNC WORK] Worker pool processing in background... (Waiting for worker completion)"
+            );
 
             // Wait for worker completion (worker takes ~1.5s in simulation)
             tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
             // 4. Pickup outcome
             let pickup_res = client
-                .post(format!("{}/api/v1/receipts/{}/pickup", cli.server, receipt.receipt_id))
+                .post(format!(
+                    "{}/api/v1/receipts/{}/pickup",
+                    cli.server, receipt.receipt_id
+                ))
                 .json(&serde_json::json!({ "agent_token": token }))
                 .send()
                 .await?;
 
             let outcome: ServiceOutcome = pickup_res.json().await?;
-            println!("4️⃣ [OUTCOME PICKUP] Agent presented receipt and collected final outcome from Vault:");
+            println!(
+                "4️⃣ [OUTCOME PICKUP] Agent presented receipt and collected final outcome from Vault:"
+            );
             println!("{}", serde_json::to_string_pretty(&outcome.result)?);
-            println!("\n✨ Full end-to-end flow verified: non-blocking Broker ingress, async execution, and Vault redemption!");
+            println!(
+                "\n✨ Full end-to-end flow verified: non-blocking Broker ingress, async execution, and Vault redemption!"
+            );
         }
     }
 

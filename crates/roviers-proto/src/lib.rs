@@ -27,7 +27,11 @@ pub struct AgentCredentials {
 }
 
 impl AgentCredentials {
-    pub fn new(agent_id: impl Into<String>, agent_name: impl Into<String>, validity_secs: i64) -> Self {
+    pub fn new(
+        agent_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        validity_secs: i64,
+    ) -> Self {
         let now = Utc::now().timestamp();
         Self {
             agent_id: agent_id.into(),
@@ -52,7 +56,10 @@ pub struct SignedAgentToken {
 
 impl SignedAgentToken {
     /// Issues a new signed agent credential using broker signing key
-    pub fn issue(credentials: AgentCredentials, signing_key: &SigningKey) -> Result<Self, ProtoError> {
+    pub fn issue(
+        credentials: AgentCredentials,
+        signing_key: &SigningKey,
+    ) -> Result<Self, ProtoError> {
         let payload_bytes = serde_json::to_vec(&credentials)?;
         let signature = signing_key.sign(&payload_bytes);
         Ok(Self {

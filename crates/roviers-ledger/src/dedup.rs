@@ -31,7 +31,7 @@ impl DedupLog {
             return true;
         }
 
-        if state.queue.len() >= self.max_entries {
+        while state.queue.len() >= self.max_entries {
             if let Some(oldest) = state.queue.pop_front() {
                 state.set.remove(&oldest);
             }
@@ -71,4 +71,3 @@ mod tests {
         assert!(!dedup.check_and_record("req_1"));
     }
 }
-

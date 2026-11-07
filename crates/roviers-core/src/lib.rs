@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 #[derive(Error, Debug)]
@@ -76,10 +76,9 @@ impl RoviersEngine {
 
         let broker_signing_key = if key_path.exists() {
             let bytes = std::fs::read(&key_path)?;
-            let key_array: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| CoreError::Auth(ProtoError::KeyError("Invalid broker key length".into())))?;
+            let key_array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                CoreError::Auth(ProtoError::KeyError("Invalid broker key length".into()))
+            })?;
             SigningKey::from_bytes(&key_array)
         } else {
             let mut rng = OsRng;
@@ -105,16 +104,18 @@ impl RoviersEngine {
                 let path = entry.path();
                 let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if file_name.ends_with(".receipt.json") {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
-                        if let Ok(r) = serde_json::from_str::<Receipt>(&data) {
-                            receipts_map.insert(r.receipt_id, r);
-                        }
+                    let receipt_res = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|data| serde_json::from_str::<Receipt>(&data).ok());
+                    if let Some(r) = receipt_res {
+                        receipts_map.insert(r.receipt_id, r);
                     }
                 } else if file_name.ends_with(".outcome.json") {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
-                        if let Ok(o) = serde_json::from_str::<ServiceOutcome>(&data) {
-                            outcomes_map.insert(o.receipt_id, o);
-                        }
+                    let outcome_res = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|data| serde_json::from_str::<ServiceOutcome>(&data).ok());
+                    if let Some(o) = outcome_res {
+                        outcomes_map.insert(o.receipt_id, o);
                     }
                 }
             }
@@ -212,7 +213,9 @@ impl RoviersEngine {
         }
 
         // Persist receipt to disk vault
-        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt.receipt_id));
+        let receipt_path = self
+            .vault_dir
+            .join(format!("{}.receipt.json", receipt.receipt_id));
         if let Ok(data) = serde_json::to_string_pretty(&receipt) {
             let _ = std::fs::write(receipt_path, data);
         }
@@ -273,7 +276,10 @@ impl RoviersEngine {
             agent_id: agent_id.clone(),
             service_name,
             status: ReceiptStatus::ReadyForPickup,
-            message: format!("Service outcome for receipt #{} is ready in the Vault", receipt_id),
+            message: format!(
+                "Service outcome for receipt #{} is ready in the Vault",
+                receipt_id
+            ),
             pickup_url: format!("/api/v1/receipts/{}/pickup", receipt_id),
             timestamp: Utc::now().timestamp(),
         };
@@ -437,7 +443,9 @@ mod tests {
             result: serde_json::json!({ "bond_id": "BOND-9999", "status": "ISSUED" }),
         };
 
-        engine.complete_service(outcome).expect("Failed to complete service");
+        engine
+            .complete_service(outcome)
+            .expect("Failed to complete service");
 
         // 6. Verify Signal was received over the broadcast bus
         let signal = signal_rx.recv().await.expect("Failed to receive signal");
@@ -500,7 +508,9 @@ mod tests {
                 completed_at: Utc::now().timestamp(),
                 result: serde_json::json!({ "status": "COMPUTED", "result_val": 42 }),
             };
-            engine.complete_service(outcome).expect("Failed to complete");
+            engine
+                .complete_service(outcome)
+                .expect("Failed to complete");
         } // engine 1 dropped here!
 
         // Session 2: New engine instance opens the same data directory
@@ -508,9 +518,14 @@ mod tests {
             let engine2 = RoviersEngine::new(&temp_dir).expect("Failed to re-open engine");
 
             // Key should have persisted, so token issued in Session 1 should still verify!
-            let receipt = engine2.get_receipt(req_id).expect("Receipt missing after restart");
+            let receipt = engine2
+                .get_receipt(req_id)
+                .expect("Receipt missing after restart");
             assert_eq!(receipt.status, ReceiptStatus::ReadyForPickup);
-            assert_eq!(receipt.callback_url, Some("http://127.0.0.1:9999/callback".into()));
+            assert_eq!(
+                receipt.callback_url,
+                Some("http://127.0.0.1:9999/callback".into())
+            );
 
             // Outcome should have persisted and be retrievable from Vault with original token
             let outcome = engine2
