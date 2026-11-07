@@ -1,0 +1,6 @@
+/target
+/roviers_data
+*.log
+citizen_id.json
+alice_id.json
+
