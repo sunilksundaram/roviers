@@ -7,7 +7,7 @@ use roviers_proto::{
     ServiceRequest, SignedCitizenToken,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex};
@@ -29,6 +29,8 @@ pub enum CoreError {
     OutcomeNotReady(Uuid),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// The core civic coordination engine
@@ -38,19 +40,70 @@ pub struct RoviersEngine {
     pub ledger: Arc<Mutex<Ledger>>,
     pub dedup_log: Arc<DedupLog>,
     pub topic_trie: Arc<TopicTrie>,
+    vault_dir: PathBuf,
     receipts: Arc<RwLock<HashMap<Uuid, Receipt>>>,
     outcomes: Arc<RwLock<HashMap<Uuid, ServiceOutcome>>>,
     intimation_bus: broadcast::Sender<IntimationNotice>,
+    http_client: reqwest::Client,
 }
 
 impl RoviersEngine {
     pub fn new(ledger_dir: impl AsRef<Path>) -> Result<Self, CoreError> {
-        let mut rng = OsRng;
-        let gov_signing_key = SigningKey::generate(&mut rng);
+        let dir = ledger_dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+
+        // 1. Persistent Authority Key Management
+        let key_path = dir.join("gov_key.bin");
+        let gov_signing_key = if key_path.exists() {
+            let bytes = std::fs::read(&key_path)?;
+            let key_array: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| CoreError::Auth(ProtoError::KeyError("Invalid gov key length".into())))?;
+            SigningKey::from_bytes(&key_array)
+        } else {
+            let mut rng = OsRng;
+            let key = SigningKey::generate(&mut rng);
+            std::fs::write(&key_path, key.to_bytes())?;
+            key
+        };
         let gov_verifying_key = gov_signing_key.verifying_key();
 
-        let ledger = Ledger::open(ledger_dir, 64 * 1024 * 1024)?;
+        // 2. Open Append-Only Ledger
+        let ledger = Ledger::open(dir, 64 * 1024 * 1024)?;
         let (intimation_bus, _) = broadcast::channel(50000);
+
+        // 3. Persistent Outcome Vault Initialization
+        let vault_dir = dir.join("vault");
+        std::fs::create_dir_all(&vault_dir)?;
+
+        let mut receipts_map = HashMap::new();
+        let mut outcomes_map = HashMap::new();
+
+        if let Ok(entries) = std::fs::read_dir(&vault_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if file_name.ends_with(".receipt.json") {
+                    if let Ok(data) = std::fs::read_to_string(&path) {
+                        if let Ok(r) = serde_json::from_str::<Receipt>(&data) {
+                            receipts_map.insert(r.receipt_id, r);
+                        }
+                    }
+                } else if file_name.ends_with(".outcome.json") {
+                    if let Ok(data) = std::fs::read_to_string(&path) {
+                        if let Ok(o) = serde_json::from_str::<ServiceOutcome>(&data) {
+                            outcomes_map.insert(o.receipt_id, o);
+                        }
+                    }
+                }
+            }
+        }
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
 
         Ok(Self {
             gov_signing_key,
@@ -58,9 +111,11 @@ impl RoviersEngine {
             ledger: Arc::new(Mutex::new(ledger)),
             dedup_log: Arc::new(DedupLog::new(100000)),
             topic_trie: Arc::new(TopicTrie::new()),
-            receipts: Arc::new(RwLock::new(HashMap::new())),
-            outcomes: Arc::new(RwLock::new(HashMap::new())),
+            vault_dir,
+            receipts: Arc::new(RwLock::new(receipts_map)),
+            outcomes: Arc::new(RwLock::new(outcomes_map)),
             intimation_bus,
+            http_client,
         })
     }
 
@@ -80,7 +135,7 @@ impl RoviersEngine {
     /// 1. Statelessly verifies citizen card (sub-microsecond)
     /// 2. Checks idempotency
     /// 3. Appends transaction to immutable ledger
-    /// 4. Generates claim-check Receipt
+    /// 4. Generates claim-check Receipt and persists to Vault
     /// 5. Publishes to topic trie for async workers
     pub async fn submit_service_request(
         &self,
@@ -107,9 +162,16 @@ impl RoviersEngine {
 
         // Step 4: Issue the Receipt (Claim-Check Token)
         let receipt = Receipt::from_request(&request, Some(5));
+
         {
             let mut r = self.receipts.write().unwrap();
             r.insert(receipt.receipt_id, receipt.clone());
+        }
+
+        // Persist receipt to disk vault
+        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt.receipt_id));
+        if let Ok(data) = serde_json::to_string_pretty(&receipt) {
+            let _ = std::fs::write(receipt_path, data);
         }
 
         // Step 5: Notify workers through topic routing trie
@@ -127,7 +189,10 @@ impl RoviersEngine {
     }
 
     /// Worker completion step:
-    /// Records final outcome and dispatches an Intimation Notice to summon the citizen
+    /// 1. Records final outcome in memory and disk vault
+    /// 2. Updates Receipt status to ReadyForPickup on disk and memory
+    /// 3. Dispatches an Intimation Notice over SSE broadcast
+    /// 4. Triggers active Webhook Callback if configured on the receipt
     pub fn complete_service(&self, outcome: ServiceOutcome) -> Result<(), CoreError> {
         let receipt_id = outcome.receipt_id;
         let citizen_id = outcome.citizen_id.clone();
@@ -135,17 +200,30 @@ impl RoviersEngine {
 
         {
             let mut outcomes = self.outcomes.write().unwrap();
-            outcomes.insert(receipt_id, outcome);
+            outcomes.insert(receipt_id, outcome.clone());
         }
 
-        {
+        // Persist outcome to disk vault
+        let outcome_path = self.vault_dir.join(format!("{}.outcome.json", receipt_id));
+        if let Ok(data) = serde_json::to_string_pretty(&outcome) {
+            let _ = std::fs::write(outcome_path, data);
+        }
+
+        let callback_url = {
             let mut receipts = self.receipts.write().unwrap();
             if let Some(r) = receipts.get_mut(&receipt_id) {
                 r.status = ReceiptStatus::ReadyForPickup;
+                let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
+                if let Ok(data) = serde_json::to_string_pretty(r) {
+                    let _ = std::fs::write(receipt_path, data);
+                }
+                r.callback_url.clone()
+            } else {
+                None
             }
-        }
+        };
 
-        // Emit Intimation Notice over the notification bus
+        // Emit Intimation Notice over the notification bus (SSE)
         let notice = IntimationNotice {
             intimation_id: Uuid::now_v7(),
             receipt_id,
@@ -157,7 +235,23 @@ impl RoviersEngine {
             timestamp: Utc::now().timestamp(),
         };
 
-        let _ = self.intimation_bus.send(notice);
+        let _ = self.intimation_bus.send(notice.clone());
+
+        // Trigger Active Webhook Callback if present
+        if let Some(url) = callback_url {
+            let client = self.http_client.clone();
+            tokio::spawn(async move {
+                tracing::info!("Dispatching webhook callback to {}", url);
+                match client.post(&url).json(&notice).send().await {
+                    Ok(resp) => {
+                        tracing::info!("Webhook delivered to {} (HTTP {})", url, resp.status());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Webhook callback delivery to {} failed: {}", url, e);
+                    }
+                }
+            });
+        }
 
         tracing::info!(
             "Service outcome recorded for receipt {}. Intimation dispatched for citizen {}",
@@ -168,7 +262,7 @@ impl RoviersEngine {
         Ok(())
     }
 
-    /// Citizen presents receipt token to collect their outcome
+    /// Citizen presents receipt token to collect their outcome from the Vault
     pub fn pickup_outcome(
         &self,
         receipt_id: Uuid,
@@ -194,6 +288,10 @@ impl RoviersEngine {
         let mut receipts = self.receipts.write().unwrap();
         if let Some(r) = receipts.get_mut(&receipt_id) {
             r.status = ReceiptStatus::Fulfilled;
+            let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
+            if let Ok(data) = serde_json::to_string_pretty(r) {
+                let _ = std::fs::write(receipt_path, data);
+            }
         }
 
         Ok(outcome.clone())
@@ -306,5 +404,64 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
-}
 
+    #[tokio::test]
+    async fn test_vault_persistence_across_restarts() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_vault_test_{}", Uuid::now_v7()));
+
+        let req_id;
+        let citizen_token;
+
+        // Session 1: Engine starts, creates key, accepts request, completes outcome
+        {
+            let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+            citizen_token = engine
+                .issue_citizen_id("CTZ-PERSIST-01", "Ada Lovelace", 86400)
+                .expect("Failed to issue token");
+
+            let request = ServiceRequest::new(
+                "computation.analytic_engine",
+                citizen_token.clone(),
+                serde_json::json!({ "algorithm": "bernoulli_numbers" }),
+                Some("http://127.0.0.1:9999/callback".into()),
+            );
+            req_id = request.request_id;
+
+            engine
+                .submit_service_request(request)
+                .await
+                .expect("Failed to submit");
+
+            let outcome = ServiceOutcome {
+                receipt_id: req_id,
+                citizen_id: "CTZ-PERSIST-01".into(),
+                service_name: "computation.analytic_engine".into(),
+                completed_at: Utc::now().timestamp(),
+                result: serde_json::json!({ "status": "COMPUTED", "result_val": 42 }),
+            };
+            engine.complete_service(outcome).expect("Failed to complete");
+        } // engine 1 dropped here!
+
+        // Session 2: New engine instance opens the same data directory
+        {
+            let engine2 = RoviersEngine::new(&temp_dir).expect("Failed to re-open engine");
+
+            // Key should have persisted, so token issued in Session 1 should still verify!
+            let receipt = engine2.get_receipt(req_id).expect("Receipt missing after restart");
+            assert_eq!(receipt.status, ReceiptStatus::ReadyForPickup);
+            assert_eq!(receipt.callback_url, Some("http://127.0.0.1:9999/callback".into()));
+
+            // Outcome should have persisted and be retrievable from Vault with original token
+            let outcome = engine2
+                .pickup_outcome(req_id, &citizen_token)
+                .expect("Failed to pick up outcome from persistent vault");
+
+            assert_eq!(outcome.result["result_val"], 42);
+
+            let fulfilled_receipt = engine2.get_receipt(req_id).unwrap();
+            assert_eq!(fulfilled_receipt.status, ReceiptStatus::Fulfilled);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}

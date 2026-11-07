@@ -128,6 +128,8 @@ pub struct Receipt {
     pub issued_at: i64,
     pub status: ReceiptStatus,
     pub estimated_ready_secs: Option<u64>,
+    #[serde(default)]
+    pub callback_url: Option<String>,
 }
 
 impl Receipt {
@@ -139,6 +141,7 @@ impl Receipt {
             issued_at: Utc::now().timestamp(),
             status: ReceiptStatus::Queued,
             estimated_ready_secs,
+            callback_url: req.callback_url.clone(),
         }
     }
 }

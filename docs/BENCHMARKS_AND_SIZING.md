@@ -122,3 +122,4 @@ When sizing your Roviers cluster:
 
 3. **Core Scaling:**
    - Roviers scales near-linearly with CPU cores up to 32 cores per single node due to lock-free topic trie routing and partitioned memory-mapped segment segments.
+

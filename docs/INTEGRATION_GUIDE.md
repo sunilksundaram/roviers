@@ -365,3 +365,4 @@ curl -X POST http://127.0.0.1:8080/api/v1/auth/citizen \
 ```
 
 The resulting JSON token file can be mounted into container environments or stored securely in secret managers (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager) and passed with every request.
+

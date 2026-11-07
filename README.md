@@ -79,12 +79,21 @@ Modern distributed environments—especially those orchestrating **AI agents, LL
 ```
 roviers/
 ├── Cargo.toml                  # Cargo Workspace Definition
+├── Dockerfile                  # Multi-stage production container build
+├── docker-compose.yml          # Containerized turnkey deployment
 ├── crates/
 │   ├── roviers-proto/          # Cryptographic IDs, Claim-Check Receipts, Outcomes, Envelopes
 │   ├── roviers-ledger/         # Memory-mapped append-only storage, Radix Topic Trie, Dedup log
-│   ├── roviers-core/           # Engine coordinating Auth, Ingress, Vault, and Intimations
+│   ├── roviers-core/           # Engine coordinating Auth, Ingress, Vault, Webhooks, and Intimations
 │   ├── roviers-server/         # Axum HTTP/SSE Service Counter & simulated background workers
 │   └── roviers-cli/            # CLI for issuing IDs, submitting requests, & real-time pickup
+├── clients/
+│   ├── python/                 # Python SDK (httpx async client + LangGraph/CrewAI tool wrapper)
+│   └── typescript/             # TypeScript SDK (universal fetch-based client for Node & Web)
+└── docs/                       # Comprehensive Operations & Integration Guides
+    ├── DEPLOYMENT_GUIDE.md     # Production deployment, systemd, Docker, Nginx SSE proxy
+    ├── BENCHMARKS_AND_SIZING.md# Empirical throughput & latency sizing models
+    └── INTEGRATION_GUIDE.md    # Real-world integration patterns & recipes
 ```
 
 ---
@@ -96,12 +105,24 @@ roviers/
 cargo test
 ```
 
-### 2. Start the Roviers Ingress & Vault Server
+### 2. Run Criterion Performance Benchmarks
+```bash
+cargo bench -p roviers-core
+```
+
+### 3. Start the Server (Local or Docker)
+
+**Local Cargo:**
 ```bash
 cargo run -p roviers-server -- --bind 127.0.0.1:8080 --data-dir ./roviers_data
 ```
 
-### 3. Run the Automated End-to-End Demo
+**Docker Compose:**
+```bash
+docker compose up -d
+```
+
+### 4. Run the Automated End-to-End Demo
 In a separate terminal:
 ```bash
 cargo run -p roviers-cli -- demo
@@ -162,6 +183,41 @@ Whenever convenient (immediately upon receiving an intimation or hours later), r
 cargo run -p roviers-cli -- pickup \
   --receipt "019318b2-5f60-7a0e-bc48-bf5b94fefdb9" \
   --token-file agent_id.json
+```
+
+---
+
+## 💻 Official Client SDKs
+
+Roviers includes first-party, lightweight SDKs designed for zero-polling async workflows:
+
+### Python Client SDK (`clients/python`)
+Designed for **AI Agents, LangGraph, CrewAI, AutoGen, and FastAPI**:
+```python
+from roviers import RoviersClient, RoviersTool
+
+client = RoviersClient(base_url="http://127.0.0.1:8080", token="agent_token.json")
+
+# 1. Non-blocking dispatch (< 5ms)
+receipt = await client.submit("service.ai.deep_analysis", {"query": "Analyze market shift"})
+
+# 2. Wait for zero-polling SSE intimation and automatically redeem from Vault
+outcome = await client.wait_for_outcome(receipt.receipt_id)
+print("Vault Outcome:", outcome.result)
+```
+
+### TypeScript / Node.js Client SDK (`clients/typescript`)
+Universal fetch-based client for **Next.js, Express, Fastify, and browser apps**:
+```typescript
+import { RoviersClient } from 'roviers';
+
+const client = new RoviersClient({ baseUrl: 'http://127.0.0.1:8080' });
+await client.issueToken('CLIENT-WEB-01', 'Production Web Cluster');
+
+// Submit asynchronous job and await vault completion via SSE
+const receipt = await client.submit('service.reports.monthly_reconcile', { month: '2026-11' });
+const outcome = await client.waitForOutcome(receipt.receipt_id);
+console.log('Outcome:', outcome.result);
 ```
 
 ---

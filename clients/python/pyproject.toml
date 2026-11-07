@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "roviers"
+version = "0.1.0"
+description = "Python client SDK for Roviers: High-Throughput Service Intake & Claim-Check Vault"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "Sunil K Sundaram" }
+]
+dependencies = [
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+agents = [
+    "langchain-core>=0.2.0",
+]

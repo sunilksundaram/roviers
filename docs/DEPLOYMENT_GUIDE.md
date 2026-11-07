@@ -350,3 +350,4 @@ Roviers emits structured JSON logs via `tracing-subscriber`. To ship logs to Dat
 ```bash
 RUST_LOG=info,roviers_core=debug roviers-server --bind 0.0.0.0:8080
 ```
+

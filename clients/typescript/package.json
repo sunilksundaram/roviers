@@ -1,0 +1,23 @@
+{
+  "name": "roviers",
+  "version": "0.1.0",
+  "description": "TypeScript/JavaScript client SDK for Roviers: High-Throughput Service Intake & Claim-Check Vault",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "roviers",
+    "claim-check",
+    "ai-agents",
+    "event-driven",
+    "sse",
+    "vault"
+  ],
+  "author": "Sunil K Sundaram",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
