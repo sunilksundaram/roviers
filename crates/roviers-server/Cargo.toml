@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "High-performance Axum HTTP & SSE broker server daemon for Roviers"
 
 [dependencies]
-roviers-proto = { path = "../roviers-proto" }
-roviers-ledger = { path = "../roviers-ledger" }
-roviers-core = { path = "../roviers-core" }
+roviers-proto = { path = "../roviers-proto", version = "0.1.0" }
+roviers-ledger = { path = "../roviers-ledger", version = "0.1.0" }
+roviers-core = { path = "../roviers-core", version = "0.1.0" }
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -30,4 +34,3 @@ rand.workspace = true
 reqwest = { workspace = true }
 http = "1.0"
 http-body-util = "0.1"
-

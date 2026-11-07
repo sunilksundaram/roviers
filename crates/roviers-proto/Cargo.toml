@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Core protocol types, cryptographic credentials, and claim-check receipts for Roviers"
 
 [dependencies]
 serde.workspace = true
@@ -14,4 +18,3 @@ uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
-

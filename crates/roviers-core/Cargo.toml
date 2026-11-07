@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Broker core engine, ed25519 claim-check receipt vault, and webhook dispatcher for Roviers"
 
 [dependencies]
-roviers-proto = { path = "../roviers-proto" }
-roviers-ledger = { path = "../roviers-ledger" }
+roviers-proto = { path = "../roviers-proto", version = "0.1.0" }
+roviers-ledger = { path = "../roviers-ledger", version = "0.1.0" }
 ed25519-dalek.workspace = true
 rand.workspace = true
 tokio.workspace = true
@@ -25,4 +29,3 @@ criterion = { workspace = true }
 [[bench]]
 name = "intake_benchmark"
 harness = false
-

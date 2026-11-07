@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Append-only memory-mapped commit log, radix topic trie, and deduplication engine for Roviers"
 
 [dependencies]
-roviers-proto = { path = "../roviers-proto" }
+roviers-proto = { path = "../roviers-proto", version = "0.1.0" }
 crc32fast.workspace = true
 memmap2.workspace = true
 lz4_flex.workspace = true
@@ -18,4 +22,3 @@ tracing.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-

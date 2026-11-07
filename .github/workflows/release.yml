@@ -93,22 +93,22 @@ jobs:
       - name: Publish roviers-proto
         run: |
           cargo publish -p roviers-proto --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          sleep 20
+          sleep 30
 
       - name: Publish roviers-ledger
         run: |
           cargo publish -p roviers-ledger --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          sleep 20
+          sleep 30
 
       - name: Publish roviers-core
         run: |
           cargo publish -p roviers-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          sleep 20
+          sleep 30
 
       - name: Publish roviers-server
         run: |
           cargo publish -p roviers-server --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          sleep 20
+          sleep 30
 
       - name: Publish roviers-cli
         run: |
