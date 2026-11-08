@@ -161,10 +161,16 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 7: Benchmark Realism & Sizing Documentation
 *Goal: Set realistic expectations for engineering teams sizing infrastructure.*
 
-- [ ] **Document Dual Throughput Reality**:
-  - Clearly document the distinction between **Broker Ingress/Egress** (100k+ msg/sec) and **End-to-End LLM Agent Turns** (~10-100 turns/sec governed by LLM latency and concurrency quotas).
-- [ ] **End-to-End Soak Test Suite**:
-  - Add simulated agent workload harness with synthetic 1.5s LLM latency, 2KB prompt payloads, and 5% HITL interruptions to measure real chassis behavior under stress.
+- [x] **Document Dual Throughput Reality & Sizing**:
+  - Published comprehensive sizing guide in `docs/SIZING_AND_CAPACITY.md`.
+  - Detailed mathematical formulation: $T_{\text{e2e}} = \min(T_{\text{ingress}}, T_{\text{execution}})$.
+  - Documented capacity sizing guidelines for 1,000, 10,000, and 100,000 concurrent agents.
+- [x] **Tiered End-to-End Soak Test Suite (`tiered_soak_benchmark`)**:
+  - **Scenario A (LLM Inference)**: 500 prompts under 15-inflight TPM rate limits with 40ms token generation latency; verified zero 429 rate-limit errors.
+  - **Scenario B (Database Saturation)**: 300 analytical queries strictly serialized through a 5-connection PostgreSQL pool; verified zero pool exhaustion errors.
+  - **Scenario C (HITL Session Rendezvous)**: 100 multi-turn loan applications parked with `SignedResumeToken` and resumed across worker threads; verified zero lost waiters.
+  - **Scenario D (Mainframe Outage & Backpressure)**: Simulated 503 outage triggering dynamic backoff (+3s cooldown); verified wire-speed shock absorption and auto-adjusting receipt ETAs.
+  - Added Criterion micro-benchmarks for worker capacity leasing and backpressure circuit-breaker lookup in `intake_benchmark.rs`.
 
 ### Phase 8: Worker Liveness, Lease Heartbeats & Dead Letter Queue (DLQ)
 *Goal: Automatically recover from worker crashes and isolate poison pill payloads.*

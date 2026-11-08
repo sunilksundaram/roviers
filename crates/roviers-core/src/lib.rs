@@ -77,6 +77,7 @@ pub struct RoviersEngine {
     pub dlq: Arc<RwLock<Vec<Receipt>>>,
     pub business_case_locks: Arc<RwLock<HashMap<String, Uuid>>>,
     pub cluster_nodes: Arc<RwLock<HashMap<String, ClusterNodeInfo>>>,
+    pub pending_requests: Arc<RwLock<HashMap<Uuid, ServiceRequest>>>,
     pub node_id: String,
     pub is_leader: bool,
     pub num_partitions: u32,
@@ -206,6 +207,7 @@ impl RoviersEngine {
             dlq: Arc::new(RwLock::new(Vec::new())),
             business_case_locks: Arc::new(RwLock::new(business_case_locks)),
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes_map)),
+            pending_requests: Arc::new(RwLock::new(HashMap::new())),
             node_id,
             is_leader: true,
             num_partitions,
@@ -329,6 +331,7 @@ impl RoviersEngine {
             let mut r = self.receipts.write().unwrap();
             r.insert(receipt.receipt_id, receipt.clone());
         }
+        self.pending_requests.write().unwrap().insert(receipt.receipt_id, request);
 
         // Persist receipt to disk vault
         let receipt_path = self
@@ -400,6 +403,7 @@ impl RoviersEngine {
             let mut locks = self.business_case_locks.write().unwrap();
             locks.remove(bkey);
         }
+        self.pending_requests.write().unwrap().remove(&receipt_id);
 
         // Emit AgentSignal over the notification bus (SSE)
         let signal = AgentSignal {
@@ -818,10 +822,20 @@ impl RoviersEngine {
             leases.insert(lease_id, active_lease);
         }
 
+        let mut granted_tasks = Vec::new();
+        {
+            let reqs = self.pending_requests.read().unwrap();
+            for id in &eligible_ids {
+                if let Some(r) = reqs.get(id) {
+                    granted_tasks.push(r.clone());
+                }
+            }
+        }
+
         Ok(WorkerLeaseResponse {
             lease_id,
             worker_id: req.worker_id,
-            granted_tasks: Vec::new(),
+            granted_tasks,
             lease_expires_at: expires_at,
         })
     }
@@ -1032,6 +1046,61 @@ impl RoviersEngine {
     pub fn release_business_case(&self, business_key: &str) -> bool {
         let mut locks = self.business_case_locks.write().unwrap();
         locks.remove(business_key).is_some()
+    }
+
+    // --- Phase 11: Vault Retention, Compaction & Lifecycle GC ---
+
+    /// Purges terminal receipts (Fulfilled, Failed) and associated outcomes
+    /// older than `max_age_secs` from in-memory index and disk storage.
+    /// Returns the number of purged receipts.
+    pub fn purge_expired_receipts(&self, max_age_secs: i64) -> usize {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now.saturating_sub(max_age_secs);
+
+        let mut to_purge = Vec::new();
+
+        {
+            let receipts = self.receipts.read().unwrap();
+            for (id, r) in receipts.iter() {
+                let is_terminal = matches!(
+                    r.status,
+                    ReceiptStatus::Fulfilled | ReceiptStatus::Failed(_)
+                );
+                if is_terminal && r.issued_at <= cutoff {
+                    to_purge.push((*id, r.business_key.clone()));
+                }
+            }
+        }
+
+        if to_purge.is_empty() {
+            return 0;
+        }
+
+        let mut purged_count = 0;
+        let mut receipts = self.receipts.write().unwrap();
+        let mut outcomes = self.outcomes.write().unwrap();
+        let mut locks = self.business_case_locks.write().unwrap();
+
+        for (id, bkey) in to_purge {
+            receipts.remove(&id);
+            outcomes.remove(&id);
+
+            if let Some(ref k) = bkey
+                && locks.get(k) == Some(&id)
+            {
+                locks.remove(k);
+            }
+
+            // Remove files from vault disk
+            let receipt_file = self.vault_dir.join(format!("{}.receipt.json", id));
+            let outcome_file = self.vault_dir.join(format!("{}.outcome.json", id));
+            let _ = std::fs::remove_file(receipt_file);
+            let _ = std::fs::remove_file(outcome_file);
+
+            purged_count += 1;
+        }
+
+        purged_count
     }
 }
 
@@ -1597,6 +1666,52 @@ mod tests {
         // 3. Verify unauthorized scope
         let scope_err = engine.verify_scope(&token, "admin:cluster");
         assert!(matches!(scope_err, Err(CoreError::ScopeForbidden(_))));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_vault_retention_and_compaction() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_compaction_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let token = engine.issue_agent_token("AGENT-GC", "GC Agent", 86400).unwrap();
+
+        // 1. Submit and fulfill an old task
+        let req1 = ServiceRequest::new("gc.test", token.clone(), serde_json::json!({ "idx": 1 }), None);
+        let id1 = req1.request_id;
+        let mut r1 = engine.submit_service_request(req1).await.unwrap();
+        // Artificially age the receipt issued_at by 100 seconds
+        r1.issued_at -= 100;
+        engine.receipts.write().unwrap().insert(id1, r1);
+
+        let outcome1 = ServiceOutcome {
+            receipt_id: id1,
+            agent_id: "AGENT-GC".into(),
+            service_name: "gc.test".into(),
+            completed_at: chrono::Utc::now().timestamp() - 100,
+            result: serde_json::json!({ "done": true }),
+            blob_ref: None,
+        };
+        engine.complete_service(outcome1).unwrap();
+        // Pick it up so status becomes Fulfilled
+        let _ = engine.pickup_outcome(id1, &token).unwrap();
+
+        // 2. Submit a fresh task (not yet fulfilled or aged)
+        let req2 = ServiceRequest::new("gc.test", token.clone(), serde_json::json!({ "idx": 2 }), None);
+        let id2 = req2.request_id;
+        let _ = engine.submit_service_request(req2).await.unwrap();
+
+        // 3. Purge terminal receipts older than 50 seconds
+        let purged = engine.purge_expired_receipts(50);
+        assert_eq!(purged, 1);
+
+        // id1 should be purged from memory and disk
+        assert!(engine.get_receipt(id1).is_none());
+        assert!(!temp_dir.join("vault").join(format!("{}.receipt.json", id1)).exists());
+
+        // id2 should remain intact
+        assert!(engine.get_receipt(id2).is_some());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
