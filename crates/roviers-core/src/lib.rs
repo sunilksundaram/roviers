@@ -5,8 +5,8 @@ use roviers_ledger::{DedupLog, Ledger, LedgerError, TopicTrie};
 use roviers_proto::{
     AgentCredentials, AgentSignal, ClusterNodeInfo, ClusterTopologyResponse, PeerHeartbeatRequest,
     ProtoError, Receipt, ReceiptStatus, ResumePayload, ServiceBackoff, ServiceOutcome,
-    ServiceRequest, SessionResumeRequest, SignedAgentToken, SignedResumeToken,
-    WorkerLeaseRequest, WorkerLeaseResponse,
+    ServiceRequest, SessionResumeRequest, SignedAgentToken, SignedResumeToken, WorkerLeaseRequest,
+    WorkerLeaseResponse,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -339,16 +339,17 @@ impl RoviersEngine {
         };
 
         // Step 4: Issue the Receipt (Claim-Check Token) with dynamic ETA accounting for active service backoff
-        let estimated_ready_secs = if let Some(backoff) = self.get_service_backoff(&request.service_name) {
-            let now = Utc::now().timestamp();
-            if backoff.backed_off_until > now {
-                Some(5 + (backoff.backed_off_until - now) as u64)
+        let estimated_ready_secs =
+            if let Some(backoff) = self.get_service_backoff(&request.service_name) {
+                let now = Utc::now().timestamp();
+                if backoff.backed_off_until > now {
+                    Some(5 + (backoff.backed_off_until - now) as u64)
+                } else {
+                    Some(5)
+                }
             } else {
                 Some(5)
-            }
-        } else {
-            Some(5)
-        };
+            };
 
         let partition_id = self.calculate_partition(&request);
         let mut receipt = Receipt::from_request(&request, estimated_ready_secs);
@@ -358,7 +359,10 @@ impl RoviersEngine {
             let mut r = self.receipts.write().unwrap();
             r.insert(receipt.receipt_id, receipt.clone());
         }
-        self.pending_requests.write().unwrap().insert(receipt.receipt_id, request.clone());
+        self.pending_requests
+            .write()
+            .unwrap()
+            .insert(receipt.receipt_id, request.clone());
 
         // Persist receipt and request to disk vault
         let receipt_path = self
@@ -409,7 +413,15 @@ impl RoviersEngine {
             let _ = std::fs::write(outcome_path, data);
         }
 
-        let (callback_url, tenant_id, session_id, business_key, traceparent, tracestate, partition_id) = {
+        let (
+            callback_url,
+            tenant_id,
+            session_id,
+            business_key,
+            traceparent,
+            tracestate,
+            partition_id,
+        ) = {
             let mut receipts = self.receipts.write().unwrap();
             if let Some(r) = receipts.get_mut(&receipt_id) {
                 r.status = ReceiptStatus::ReadyForPickup;
@@ -766,7 +778,10 @@ impl RoviersEngine {
         let mut backoffs = self.service_backoffs.write().unwrap();
         let was_backed_off = backoffs.remove(service_name).is_some();
         if was_backed_off {
-            tracing::info!("Service '{}' backoff cleared; steady-state dispatch resumed", service_name);
+            tracing::info!(
+                "Service '{}' backoff cleared; steady-state dispatch resumed",
+                service_name
+            );
         }
         was_backed_off
     }
@@ -802,11 +817,18 @@ impl RoviersEngine {
 
         for (id, r) in receipts.iter() {
             if r.status == ReceiptStatus::Queued {
-                if req.service_filter.as_deref().is_some_and(|f| f != r.service_name) {
+                if req
+                    .service_filter
+                    .as_deref()
+                    .is_some_and(|f| f != r.service_name)
+                {
                     continue;
                 }
                 // Honor active service backoff!
-                if self.get_service_backoff(&r.service_name).is_some_and(|b| b.backed_off_until > Utc::now().timestamp()) {
+                if self
+                    .get_service_backoff(&r.service_name)
+                    .is_some_and(|b| b.backed_off_until > Utc::now().timestamp())
+                {
                     continue;
                 }
                 let tenant = r.tenant_id.clone().unwrap_or_else(|| "default".into());
@@ -984,7 +1006,8 @@ impl RoviersEngine {
             let mut pending = self.pending_requests.write().unwrap();
             for task_id in dead_lettered_ids {
                 pending.remove(&task_id);
-                let _ = std::fs::remove_file(self.vault_dir.join(format!("{}.request.json", task_id)));
+                let _ =
+                    std::fs::remove_file(self.vault_dir.join(format!("{}.request.json", task_id)));
             }
         }
 
@@ -1080,7 +1103,13 @@ impl RoviersEngine {
 
         ClusterTopologyResponse {
             cluster_id: "roviers-primary-cluster".into(),
-            leader_node_id: leader_id.or_else(|| if self.is_leader { Some(self.node_id.clone()) } else { None }),
+            leader_node_id: leader_id.or_else(|| {
+                if self.is_leader {
+                    Some(self.node_id.clone())
+                } else {
+                    None
+                }
+            }),
             total_partitions: self.num_partitions,
             nodes: list,
         }
@@ -1089,9 +1118,17 @@ impl RoviersEngine {
     // --- Phase 4: Multi-Tenant Scoped Security ---
 
     /// Verify agent token has required scope (supports wildcard "service:all" or specific scope)
-    pub fn verify_scope(&self, token: &SignedAgentToken, required_scope: &str) -> Result<(), CoreError> {
+    pub fn verify_scope(
+        &self,
+        token: &SignedAgentToken,
+        required_scope: &str,
+    ) -> Result<(), CoreError> {
         let creds = token.verify(&self.broker_verifying_key)?;
-        if creds.scopes.iter().any(|s| s == "service:all" || s == "*" || s == required_scope) {
+        if creds
+            .scopes
+            .iter()
+            .any(|s| s == "service:all" || s == "*" || s == required_scope)
+        {
             Ok(())
         } else {
             Err(CoreError::ScopeForbidden(required_scope.to_string()))
@@ -1386,7 +1423,10 @@ mod tests {
             None,
         );
         let req_id = request.request_id;
-        let receipt = engine.submit_service_request(request).await.expect("Submit failed");
+        let receipt = engine
+            .submit_service_request(request)
+            .await
+            .expect("Submit failed");
         assert_eq!(receipt.status, ReceiptStatus::Queued);
 
         // 2. Worker begins work, needs clarification, and parks for HITL input
@@ -1401,13 +1441,22 @@ mod tests {
             .expect("Park for input failed");
 
         // 3. Verify signal sent to user/client over SSE
-        let park_signal = signal_rx.recv().await.expect("Failed to receive park signal");
+        let park_signal = signal_rx
+            .recv()
+            .await
+            .expect("Failed to receive park signal");
         assert_eq!(park_signal.receipt_id, req_id);
-        assert!(matches!(park_signal.status, ReceiptStatus::ParkedAwaitingInput { .. }));
+        assert!(matches!(
+            park_signal.status,
+            ReceiptStatus::ParkedAwaitingInput { .. }
+        ));
 
         // 4. Verify receipt status is now ParkedAwaitingInput
         let parked_receipt = engine.get_receipt(req_id).unwrap();
-        assert!(matches!(parked_receipt.status, ReceiptStatus::ParkedAwaitingInput { .. }));
+        assert!(matches!(
+            parked_receipt.status,
+            ReceiptStatus::ParkedAwaitingInput { .. }
+        ));
 
         // 5. User provides answer using ResumeToken
         let resume_request = SessionResumeRequest {
@@ -1416,11 +1465,16 @@ mod tests {
             agent_token: agent_token.clone(),
         };
 
-        let resumed_receipt = engine.resume_session(resume_request).expect("Resume session failed");
+        let resumed_receipt = engine
+            .resume_session(resume_request)
+            .expect("Resume session failed");
         assert_eq!(resumed_receipt.status, ReceiptStatus::Processing);
 
         // 6. Verify resume signal was emitted over SSE
-        let resume_signal = signal_rx.recv().await.expect("Failed to receive resume signal");
+        let resume_signal = signal_rx
+            .recv()
+            .await
+            .expect("Failed to receive resume signal");
         assert_eq!(resume_signal.receipt_id, req_id);
         assert_eq!(resume_signal.status, ReceiptStatus::Processing);
 
@@ -1435,7 +1489,9 @@ mod tests {
         };
         engine.complete_service(outcome).expect("Completion failed");
 
-        let final_outcome = engine.pickup_outcome(req_id, &agent_token).expect("Pickup failed");
+        let final_outcome = engine
+            .pickup_outcome(req_id, &agent_token)
+            .expect("Pickup failed");
         assert_eq!(final_outcome.result["total"], 120.50);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1443,7 +1499,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_backpressure_and_dynamic_backoff() {
-        let temp_dir = std::env::temp_dir().join(format!("roviers_backoff_test_{}", Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("roviers_backoff_test_{}", Uuid::now_v7()));
         let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
 
         let agent_token = engine
@@ -1453,8 +1510,16 @@ mod tests {
         let service = "legacy_erp.reconcile";
 
         // 1. Normal submission has default baseline ETA (5s)
-        let req1 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 1 }), None);
-        let receipt1 = engine.submit_service_request(req1).await.expect("Submit 1 failed");
+        let req1 = ServiceRequest::new(
+            service,
+            agent_token.clone(),
+            serde_json::json!({ "batch": 1 }),
+            None,
+        );
+        let receipt1 = engine
+            .submit_service_request(req1)
+            .await
+            .expect("Submit 1 failed");
         assert_eq!(receipt1.estimated_ready_secs, Some(5));
 
         // 2. Worker detects downstream 429/timeout and dynamically sets backoff (e.g. 60s)
@@ -1468,8 +1533,16 @@ mod tests {
         assert_eq!(backoff.concurrency_cap, 2);
 
         // 3. New requests submitted during backoff are still accepted (shock absorber) with adjusted ETA
-        let req2 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 2 }), None);
-        let receipt2 = engine.submit_service_request(req2).await.expect("Submit 2 during backoff should succeed");
+        let req2 = ServiceRequest::new(
+            service,
+            agent_token.clone(),
+            serde_json::json!({ "batch": 2 }),
+            None,
+        );
+        let receipt2 = engine
+            .submit_service_request(req2)
+            .await
+            .expect("Submit 2 during backoff should succeed");
         assert_eq!(receipt2.status, ReceiptStatus::Queued);
         assert!(receipt2.estimated_ready_secs.unwrap() >= 60);
 
@@ -1484,8 +1557,16 @@ mod tests {
         assert!(engine.get_service_backoff(service).is_none());
 
         // 6. Next request returns to normal baseline ETA
-        let req3 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 3 }), None);
-        let receipt3 = engine.submit_service_request(req3).await.expect("Submit 3 failed");
+        let req3 = ServiceRequest::new(
+            service,
+            agent_token.clone(),
+            serde_json::json!({ "batch": 3 }),
+            None,
+        );
+        let receipt3 = engine
+            .submit_service_request(req3)
+            .await
+            .expect("Submit 3 failed");
         assert_eq!(receipt3.estimated_ready_secs, Some(5));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1561,7 +1642,12 @@ mod tests {
             sha256_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
         };
 
-        let req = ServiceRequest::new("quote.pdf", agent_token.clone(), serde_json::json!({ "quote_id": 1001 }), None);
+        let req = ServiceRequest::new(
+            "quote.pdf",
+            agent_token.clone(),
+            serde_json::json!({ "quote_id": 1001 }),
+            None,
+        );
         let req_id = req.request_id;
         let _ = engine.submit_service_request(req).await.unwrap();
 
@@ -1573,15 +1659,24 @@ mod tests {
             blob_ref.clone(),
         );
 
-        engine.complete_service(blob_outcome).expect("Complete blob service failed");
+        engine
+            .complete_service(blob_outcome)
+            .expect("Complete blob service failed");
 
-        let picked_up = engine.pickup_outcome(req_id, &agent_token).expect("Pickup failed");
+        let picked_up = engine
+            .pickup_outcome(req_id, &agent_token)
+            .expect("Pickup failed");
         assert!(picked_up.blob_ref.is_some());
         assert_eq!(picked_up.blob_ref.unwrap().size_bytes, 4_500_000);
 
         // 2. Dead Letter Queue & Expired Lease Reclaim
         // Submit a poison pill task
-        let poison_req = ServiceRequest::new("flaky.task", agent_token.clone(), serde_json::json!({ "flaky": true }), None);
+        let poison_req = ServiceRequest::new(
+            "flaky.task",
+            agent_token.clone(),
+            serde_json::json!({ "flaky": true }),
+            None,
+        );
         let poison_id = poison_req.request_id;
         let _ = engine.submit_service_request(poison_req).await.unwrap();
 
@@ -1593,15 +1688,22 @@ mod tests {
             available_tpm_budget: None,
             active_inflight: 0,
         };
-        let _ = engine.lease_tasks(lease_req.clone(), -1).expect("Lease failed");
+        let _ = engine
+            .lease_tasks(lease_req.clone(), -1)
+            .expect("Lease failed");
 
         // Reclaim attempt 1: task is re-queued
         let reclaimed_1 = engine.reclaim_expired_leases();
         assert_eq!(reclaimed_1, vec![poison_id]);
-        assert_eq!(engine.get_receipt(poison_id).unwrap().status, ReceiptStatus::Queued);
+        assert_eq!(
+            engine.get_receipt(poison_id).unwrap().status,
+            ReceiptStatus::Queued
+        );
 
         // Re-lease and crash attempt 2
-        let _ = engine.lease_tasks(lease_req.clone(), -1).expect("Lease 2 failed");
+        let _ = engine
+            .lease_tasks(lease_req.clone(), -1)
+            .expect("Lease 2 failed");
         let reclaimed_2 = engine.reclaim_expired_leases();
         assert_eq!(reclaimed_2, vec![poison_id]);
 
@@ -1623,19 +1725,33 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("roviers_fair_test_{}", Uuid::now_v7()));
         let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
 
-        let token_a = engine.issue_agent_token("AGENT-A", "Tenant A Agent", 86400).unwrap();
-        let token_b = engine.issue_agent_token("AGENT-B", "Tenant B Agent", 86400).unwrap();
+        let token_a = engine
+            .issue_agent_token("AGENT-A", "Tenant A Agent", 86400)
+            .unwrap();
+        let token_b = engine
+            .issue_agent_token("AGENT-B", "Tenant B Agent", 86400)
+            .unwrap();
 
         // Tenant A submits 3 batch jobs
         for i in 0..3 {
-            let req = ServiceRequest::new("analytics.crunch", token_a.clone(), serde_json::json!({ "job": i }), None)
-                .with_tenant("tenant-A");
+            let req = ServiceRequest::new(
+                "analytics.crunch",
+                token_a.clone(),
+                serde_json::json!({ "job": i }),
+                None,
+            )
+            .with_tenant("tenant-A");
             let _ = engine.submit_service_request(req).await.unwrap();
         }
 
         // Tenant B submits 1 urgent interactive job
-        let req_b = ServiceRequest::new("analytics.crunch", token_b.clone(), serde_json::json!({ "urgent": true }), None)
-                .with_tenant("tenant-B");
+        let req_b = ServiceRequest::new(
+            "analytics.crunch",
+            token_b.clone(),
+            serde_json::json!({ "urgent": true }),
+            None,
+        )
+        .with_tenant("tenant-B");
         let b_id = req_b.request_id;
         let _ = engine.submit_service_request(req_b).await.unwrap();
 
@@ -1649,7 +1765,13 @@ mod tests {
         };
 
         let lease = engine.lease_tasks(lease_req, 60).unwrap();
-        let active_lease = engine.worker_leases.read().unwrap().get(&lease.lease_id).unwrap().clone();
+        let active_lease = engine
+            .worker_leases
+            .read()
+            .unwrap()
+            .get(&lease.lease_id)
+            .unwrap()
+            .clone();
 
         // Fair scheduling guarantees Tenant B is included in the very first batch of 2,
         // avoiding starvation behind Tenant A's batch!
@@ -1660,19 +1782,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_business_case_idempotency_locking() {
-        let temp_dir = std::env::temp_dir().join(format!("roviers_case_lock_test_{}", Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("roviers_case_lock_test_{}", Uuid::now_v7()));
         let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
 
-        let token = engine.issue_agent_token("AGENT-CASE-01", "Case Worker", 86400).unwrap();
+        let token = engine
+            .issue_agent_token("AGENT-CASE-01", "Case Worker", 86400)
+            .unwrap();
 
         let business_key = "claim:CLM-2026-9999";
 
         // 1. Submit initial request with business_key
-        let req1 = ServiceRequest::new("claims.process", token.clone(), serde_json::json!({ "amount": 500 }), None)
-            .with_business_key(business_key);
+        let req1 = ServiceRequest::new(
+            "claims.process",
+            token.clone(),
+            serde_json::json!({ "amount": 500 }),
+            None,
+        )
+        .with_business_key(business_key);
         let req1_id = req1.request_id;
 
-        let receipt1 = engine.submit_service_request(req1).await.expect("Submit 1 failed");
+        let receipt1 = engine
+            .submit_service_request(req1)
+            .await
+            .expect("Submit 1 failed");
         assert_eq!(receipt1.business_key, Some(business_key.to_string()));
 
         // Verify case lock is held
@@ -1681,8 +1814,13 @@ mod tests {
         assert_eq!(locked_receipt.unwrap().receipt_id, req1_id);
 
         // 2. Submit second request with the same business_key while first is active -> Should fail with BusinessCaseLocked
-        let req2 = ServiceRequest::new("claims.process", token.clone(), serde_json::json!({ "amount": 600 }), None)
-            .with_business_key(business_key);
+        let req2 = ServiceRequest::new(
+            "claims.process",
+            token.clone(),
+            serde_json::json!({ "amount": 600 }),
+            None,
+        )
+        .with_business_key(business_key);
 
         let err = engine.submit_service_request(req2).await;
         match err {
@@ -1708,9 +1846,17 @@ mod tests {
         assert!(engine.get_business_case(business_key).is_none());
 
         // 4. Submitting a new case under the same business_key should now succeed
-        let req3 = ServiceRequest::new("claims.process", token.clone(), serde_json::json!({ "amount": 700 }), None)
-            .with_business_key(business_key);
-        let receipt3 = engine.submit_service_request(req3).await.expect("Submit 3 failed");
+        let req3 = ServiceRequest::new(
+            "claims.process",
+            token.clone(),
+            serde_json::json!({ "amount": 700 }),
+            None,
+        )
+        .with_business_key(business_key);
+        let receipt3 = engine
+            .submit_service_request(req3)
+            .await
+            .expect("Submit 3 failed");
         assert_eq!(receipt3.business_key, Some(business_key.to_string()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1718,7 +1864,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_topology_and_partitioning() {
-        let temp_dir = std::env::temp_dir().join(format!("roviers_cluster_test_{}", Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("roviers_cluster_test_{}", Uuid::now_v7()));
         let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
 
         // 1. Initial topology
@@ -1740,7 +1887,9 @@ mod tests {
         assert_eq!(updated_topology.nodes.len(), 2);
 
         // 3. Test deterministic virtual partition calculation
-        let token = engine.issue_agent_token("AGENT-PART-01", "Agent", 86400).unwrap();
+        let token = engine
+            .issue_agent_token("AGENT-PART-01", "Agent", 86400)
+            .unwrap();
         let req = ServiceRequest::new("test.svc", token, serde_json::json!({}), None)
             .with_tenant("tenant-corp-x");
         let partition = engine.calculate_partition(&req);
@@ -1759,11 +1908,20 @@ mod tests {
 
         // 1. Issue token with restricted scopes
         let token = engine
-            .issue_scoped_agent_token("AGENT-SCOPED-01", "Scoped Agent", 86400, vec!["tasks:read".into(), "tasks:write".into()], Some("tenant-42".into()))
+            .issue_scoped_agent_token(
+                "AGENT-SCOPED-01",
+                "Scoped Agent",
+                86400,
+                vec!["tasks:read".into(), "tasks:write".into()],
+                Some("tenant-42".into()),
+            )
             .expect("Failed to issue scoped token");
 
         assert_eq!(token.credentials.tenant_id, Some("tenant-42".into()));
-        assert_eq!(token.credentials.scopes, vec!["tasks:read".to_string(), "tasks:write".to_string()]);
+        assert_eq!(
+            token.credentials.scopes,
+            vec!["tasks:read".to_string(), "tasks:write".to_string()]
+        );
 
         // 2. Verify valid scope
         assert!(engine.verify_scope(&token, "tasks:read").is_ok());
@@ -1778,13 +1936,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_vault_retention_and_compaction() {
-        let temp_dir = std::env::temp_dir().join(format!("roviers_compaction_test_{}", Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("roviers_compaction_test_{}", Uuid::now_v7()));
         let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
 
-        let token = engine.issue_agent_token("AGENT-GC", "GC Agent", 86400).unwrap();
+        let token = engine
+            .issue_agent_token("AGENT-GC", "GC Agent", 86400)
+            .unwrap();
 
         // 1. Submit and fulfill an old task
-        let req1 = ServiceRequest::new("gc.test", token.clone(), serde_json::json!({ "idx": 1 }), None);
+        let req1 = ServiceRequest::new(
+            "gc.test",
+            token.clone(),
+            serde_json::json!({ "idx": 1 }),
+            None,
+        );
         let id1 = req1.request_id;
         let mut r1 = engine.submit_service_request(req1).await.unwrap();
         // Artificially age the receipt issued_at by 100 seconds
@@ -1804,7 +1970,12 @@ mod tests {
         let _ = engine.pickup_outcome(id1, &token).unwrap();
 
         // 2. Submit a fresh task (not yet fulfilled or aged)
-        let req2 = ServiceRequest::new("gc.test", token.clone(), serde_json::json!({ "idx": 2 }), None);
+        let req2 = ServiceRequest::new(
+            "gc.test",
+            token.clone(),
+            serde_json::json!({ "idx": 2 }),
+            None,
+        );
         let id2 = req2.request_id;
         let _ = engine.submit_service_request(req2).await.unwrap();
 
@@ -1814,7 +1985,12 @@ mod tests {
 
         // id1 should be purged from memory and disk
         assert!(engine.get_receipt(id1).is_none());
-        assert!(!temp_dir.join("vault").join(format!("{}.receipt.json", id1)).exists());
+        assert!(
+            !temp_dir
+                .join("vault")
+                .join(format!("{}.receipt.json", id1))
+                .exists()
+        );
 
         // id2 should remain intact
         assert!(engine.get_receipt(id2).is_some());

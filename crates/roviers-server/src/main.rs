@@ -34,7 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("👷 Spawning built-in demo worker pool for local simulation...");
         spawn_worker_pool(Arc::clone(&engine));
     } else {
-        tracing::info!("🏛️ Roviers Broker ready for external worker capacity leasing (/api/v1/workers/lease)");
+        tracing::info!(
+            "🏛️ Roviers Broker ready for external worker capacity leasing (/api/v1/workers/lease)"
+        );
     }
 
     let app = create_app(engine);

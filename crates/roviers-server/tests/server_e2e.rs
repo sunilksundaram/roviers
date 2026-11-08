@@ -283,7 +283,10 @@ async fn test_server_hitl_park_and_resume_http() {
     assert_eq!(res.status(), StatusCode::OK);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let r: Receipt = serde_json::from_slice(&bytes).unwrap();
-    assert!(matches!(r.status, ReceiptStatus::ParkedAwaitingInput { .. }));
+    assert!(matches!(
+        r.status,
+        ReceiptStatus::ParkedAwaitingInput { .. }
+    ));
 
     // 5. User submits answer to resume the session
     let resume_body = serde_json::to_vec(&SessionResumeRequest {
@@ -775,7 +778,8 @@ async fn test_server_dlq_and_two_tier_blob_vault_http() {
 
 #[tokio::test]
 async fn test_server_case_locking_and_cluster_http() {
-    let temp_dir = std::env::temp_dir().join(format!("roviers_case_cluster_test_{}", Uuid::now_v7()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("roviers_case_cluster_test_{}", Uuid::now_v7()));
     let engine = Arc::new(RoviersEngine::new(&temp_dir).expect("Failed to init engine"));
     let app = create_app(Arc::clone(&engine));
 
@@ -958,7 +962,8 @@ async fn test_server_case_locking_and_cluster_http() {
 
 #[tokio::test]
 async fn test_server_vault_compaction_and_w3c_tracing_http() {
-    let temp_dir = std::env::temp_dir().join(format!("roviers_compaction_w3c_test_{}", Uuid::now_v7()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("roviers_compaction_w3c_test_{}", Uuid::now_v7()));
     let engine = Arc::new(RoviersEngine::new(&temp_dir).expect("Failed to init engine"));
     let app = create_app(Arc::clone(&engine));
 

@@ -157,7 +157,12 @@ impl ServiceRequest {
         self
     }
 
-    pub fn with_session(mut self, session_id: impl Into<String>, turn_id: u64, parent: Option<Uuid>) -> Self {
+    pub fn with_session(
+        mut self,
+        session_id: impl Into<String>,
+        turn_id: u64,
+        parent: Option<Uuid>,
+    ) -> Self {
         self.session_turn = Some(SessionTurn {
             session_id: session_id.into(),
             turn_id,
@@ -171,7 +176,11 @@ impl ServiceRequest {
         self
     }
 
-    pub fn with_tracing(mut self, traceparent: impl Into<String>, tracestate: Option<String>) -> Self {
+    pub fn with_tracing(
+        mut self,
+        traceparent: impl Into<String>,
+        tracestate: Option<String>,
+    ) -> Self {
         self.traceparent = Some(traceparent.into());
         self.tracestate = tracestate;
         self
@@ -535,7 +544,9 @@ mod tests {
         };
         let resume_token = SignedResumeToken::issue(resume_payload.clone(), &signing_key)
             .expect("Failed to issue resume token");
-        let verified_resume = resume_token.verify(&verifying_key).expect("Resume token verify failed");
+        let verified_resume = resume_token
+            .verify(&verifying_key)
+            .expect("Resume token verify failed");
         assert_eq!(verified_resume.session_id, "SESSION-99");
         assert_eq!(verified_resume.turn_id, 2);
     }

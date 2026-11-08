@@ -40,12 +40,26 @@ enum Commands {
         data: String,
         #[arg(short, long)]
         callback: Option<String>,
+        #[arg(short, long)]
+        business_key: Option<String>,
+        #[arg(short, long)]
+        tenant_id: Option<String>,
     },
 
     /// Check status of an issued receipt
     Status {
         #[arg(short, long)]
         receipt: Uuid,
+    },
+
+    /// Cancel an active in-flight task
+    Cancel {
+        #[arg(short, long)]
+        receipt: Uuid,
+        #[arg(short, long, default_value = "agent_id.json")]
+        token_file: PathBuf,
+        #[arg(short, long)]
+        reason: Option<String>,
     },
 
     /// Redeem receipt and collect final service outcome from the Broker Vault
@@ -68,6 +82,24 @@ enum Commands {
     Listen {
         #[arg(short, long, alias = "citizen-id")]
         agent_id: String,
+    },
+
+    /// Compact old completed and failed receipts in the Vault
+    Compact {
+        #[arg(short, long, default_value = "86400")]
+        max_age_secs: i64,
+    },
+
+    /// List all tasks currently diverted to the Dead Letter Queue
+    Dlq,
+
+    /// Retrieve full cluster node topology and partition assignments
+    Cluster,
+
+    /// Inspect an active business case lock
+    Case {
+        #[arg(short, long)]
+        key: String,
     },
 
     /// Run full automated end-to-end demonstration
@@ -116,13 +148,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token_file,
             data,
             callback,
+            business_key,
+            tenant_id,
         } => {
             let token_str = fs::read_to_string(&token_file)?;
             let token: SignedAgentToken = serde_json::from_str(&token_str)?;
             let payload: serde_json::Value = serde_json::from_str(&data)?;
 
             println!("🏛️ Dispatching task to Roviers Broker for '{}'...", service);
-            let req = ServiceRequest::new(service.clone(), token, payload, callback);
+            let mut req = ServiceRequest::new(service.clone(), token, payload, callback);
+            req.business_key = business_key;
+            req.tenant_id = tenant_id;
 
             let res = client
                 .post(format!("{}/api/v1/services/{}", cli.server, service))
@@ -141,6 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("   Agent ID:     {}", receipt.agent_id);
             println!("   Service:      {}", receipt.service_name);
             println!("   Status:       {:?}", receipt.status);
+            if let Some(ref bk) = receipt.business_key {
+                println!("   Business Key: {}", bk);
+            }
+            if let Some(ref tid) = receipt.tenant_id {
+                println!("   Tenant ID:    {}", tid);
+            }
             println!(
                 "   Est. Ready:   {:?} seconds",
                 receipt.estimated_ready_secs
@@ -148,6 +190,124 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "\n💡 Connection freed. You will receive an SSE Signal or Webhook when ready."
             );
+        }
+
+        Commands::Cancel {
+            receipt,
+            token_file,
+            reason,
+        } => {
+            let token_str = fs::read_to_string(&token_file)?;
+            let token: SignedAgentToken = serde_json::from_str(&token_str)?;
+
+            println!("🛑 Cancelling active receipt #{}...", receipt);
+            let res = client
+                .post(format!("{}/api/v1/receipts/{}/cancel", cli.server, receipt))
+                .json(&serde_json::json!({
+                    "receipt_id": receipt,
+                    "agent_token": token,
+                    "reason": reason
+                }))
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                eprintln!("❌ Cancellation failed: {}", res.text().await?);
+                return Ok(());
+            }
+
+            let r: Receipt = res.json().await?;
+            println!("✅ Receipt cancelled successfully (Status: {:?})", r.status);
+        }
+
+        Commands::Compact { max_age_secs } => {
+            println!(
+                "🧹 Requesting Vault Compaction (max_age_secs: {})...",
+                max_age_secs
+            );
+            let res = client
+                .post(format!("{}/api/v1/vault/compact", cli.server))
+                .json(&serde_json::json!({ "max_age_secs": max_age_secs }))
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                eprintln!("❌ Compaction request failed: {}", res.text().await?);
+                return Ok(());
+            }
+
+            let result: serde_json::Value = res.json().await?;
+            println!("✅ Vault Compaction Completed!");
+            println!("   Purged Receipts: {}", result["purged_receipts"]);
+        }
+
+        Commands::Dlq => {
+            println!("📬 Querying Dead Letter Queue (DLQ)...");
+            let res = client
+                .get(format!("{}/api/v1/dlq", cli.server))
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                eprintln!("❌ DLQ fetch failed: {}", res.text().await?);
+                return Ok(());
+            }
+
+            let dlq: Vec<Receipt> = res.json().await?;
+            if dlq.is_empty() {
+                println!("🎉 DLQ is currently empty. All tasks healthy!");
+            } else {
+                println!("⚠️ Found {} dead-lettered tasks in DLQ:", dlq.len());
+                for r in dlq {
+                    println!(
+                        "   • #{} [{}] Status: {:?}",
+                        r.receipt_id, r.service_name, r.status
+                    );
+                }
+            }
+        }
+
+        Commands::Cluster => {
+            println!("🌐 Fetching Cluster Node Topology...");
+            let res = client
+                .get(format!("{}/api/v1/cluster/nodes", cli.server))
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                eprintln!("❌ Cluster query failed: {}", res.text().await?);
+                return Ok(());
+            }
+
+            let topo: serde_json::Value = res.json().await?;
+            println!("🏛️ Roviers Cluster Info:");
+            println!("   Cluster ID:       {}", topo["cluster_id"]);
+            println!("   Leader Node ID:   {}", topo["leader_node_id"]);
+            println!("   Total Partitions: {}", topo["total_partitions"]);
+            println!(
+                "   Nodes in Cluster: {}",
+                topo["nodes"].as_array().map_or(0, |a| a.len())
+            );
+        }
+
+        Commands::Case { key } => {
+            println!("🔒 Inspecting Business Case Lock for key '{}'...", key);
+            let res = client
+                .get(format!("{}/api/v1/cases/{}", cli.server, key))
+                .send()
+                .await?;
+
+            if res.status().as_u16() == 404 {
+                println!("🔓 No active lease for key '{}'. Slot is open.", key);
+                return Ok(());
+            }
+
+            let receipt: Receipt = res.json().await?;
+            println!("🔒 Active Case Lock Found:");
+            println!("   Receipt ID:   {}", receipt.receipt_id);
+            println!("   Agent ID:     {}", receipt.agent_id);
+            println!("   Service:      {}", receipt.service_name);
+            println!("   Status:       {:?}", receipt.status);
         }
 
         Commands::Status { receipt } => {

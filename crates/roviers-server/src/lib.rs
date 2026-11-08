@@ -5,13 +5,12 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
-use tower_http::cors::{Any, CorsLayer};
 use futures::stream::Stream;
 use roviers_core::RoviersEngine;
 use roviers_proto::{
-    BlobReference, CancellationRequest, ClusterTopologyResponse,
-    ParkForInputRequest, PeerHeartbeatRequest, Receipt, ServiceBackoff, ServiceOutcome,
-    ServiceRequest, SessionResumeRequest, SetBackoffRequest, SignedAgentToken, SignedResumeToken,
+    BlobReference, CancellationRequest, ClusterTopologyResponse, ParkForInputRequest,
+    PeerHeartbeatRequest, Receipt, ServiceBackoff, ServiceOutcome, ServiceRequest,
+    SessionResumeRequest, SetBackoffRequest, SignedAgentToken, SignedResumeToken,
     WorkerHeartbeatRequest, WorkerLeaseRequest, WorkerLeaseResponse,
 };
 use serde::Deserialize;
@@ -20,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -103,7 +103,10 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
         // In-Flight Task Cancellation
         .route("/api/v1/receipts/{receipt_id}/cancel", post(cancel_receipt))
         // Business Key Idempotency & Case Locking
-        .route("/api/v1/cases/{business_key}", get(get_business_case).delete(release_business_case))
+        .route(
+            "/api/v1/cases/{business_key}",
+            get(get_business_case).delete(release_business_case),
+        )
         // Worker Capacity Leases & Heartbeats
         .route("/api/v1/workers/lease", post(lease_tasks))
         .route("/api/v1/workers/heartbeat", post(worker_heartbeat))
@@ -207,17 +210,15 @@ pub async fn submit_service(
         Err(roviers_core::CoreError::DuplicateRequest(id)) => {
             Err((StatusCode::CONFLICT, format!("Duplicate request: {}", id)))
         }
-        Err(roviers_core::CoreError::BusinessCaseLocked(k, id)) => {
-            Err((
-                StatusCode::CONFLICT,
-                serde_json::json!({
-                    "error": "BusinessCaseLocked",
-                    "business_key": k,
-                    "existing_receipt_id": id
-                })
-                .to_string(),
-            ))
-        }
+        Err(roviers_core::CoreError::BusinessCaseLocked(k, id)) => Err((
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "BusinessCaseLocked",
+                "business_key": k,
+                "existing_receipt_id": id
+            })
+            .to_string(),
+        )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
@@ -278,7 +279,10 @@ pub async fn get_receipt(
     State(state): State<AppState>,
     Path(receipt_id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<Receipt>), StatusCode> {
-    let receipt = state.engine.get_receipt(receipt_id).ok_or(StatusCode::NOT_FOUND)?;
+    let receipt = state
+        .engine
+        .get_receipt(receipt_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
     let mut resp_headers = HeaderMap::new();
     if let Some(ref tp) = receipt.traceparent
         && let Ok(val) = HeaderValue::from_str(tp)

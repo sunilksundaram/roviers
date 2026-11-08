@@ -1,5 +1,5 @@
 # Multi-stage production build for Roviers
-FROM rust:1.82-bookworm AS builder
+FROM rust:bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p roviers-server -p roviers-cli

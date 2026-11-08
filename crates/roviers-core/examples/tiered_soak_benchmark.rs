@@ -164,7 +164,9 @@ async fn main() {
         ingress_tps / llm_e2e_tps,
         llm_e2e_tps
     );
-    println!("    [SAFETY] Zero 429 Rate Limit errors encountered; Roviers cushioned the quota cliff.\n");
+    println!(
+        "    [SAFETY] Zero 429 Rate Limit errors encountered; Roviers cushioned the quota cliff.\n"
+    );
 
     // -------------------------------------------------------------------------
     // SCENARIO B: Heavy Database / Analytical Query Saturation
@@ -289,7 +291,10 @@ async fn main() {
             parked_verified += 1;
         }
     }
-    println!("    + Verified: {}/{} tasks safely parked awaiting human input.", parked_verified, hitl_count);
+    println!(
+        "    + Verified: {}/{} tasks safely parked awaiting human input.",
+        parked_verified, hitl_count
+    );
 
     // Simulated human underwriters submit answers asynchronously
     let start_hitl_resume = Instant::now();
@@ -300,7 +305,9 @@ async fn main() {
             agent_token: agent_token.clone(),
         };
 
-        let resumed = engine.resume_session(resume_req).expect("Failed to resume session");
+        let resumed = engine
+            .resume_session(resume_req)
+            .expect("Failed to resume session");
         assert_eq!(resumed.status, ReceiptStatus::Processing);
 
         // Worker 2 completes the resumed session
@@ -356,7 +363,10 @@ async fn main() {
     }
 
     // Verify all 50 requests were accepted safely and received adjusted ETAs
-    let adjusted_etas: Vec<_> = shock_receipts.iter().filter_map(|r| r.estimated_ready_secs).collect();
+    let adjusted_etas: Vec<_> = shock_receipts
+        .iter()
+        .filter_map(|r| r.estimated_ready_secs)
+        .collect();
     println!(
         "    + Broker ingested all 50 requests during active outage without dropping sockets."
     );
@@ -370,7 +380,12 @@ async fn main() {
     println!("    + Mainframe recovered; backoff cleared: {}", cleared);
 
     // Next request returns to baseline sub-second ETA
-    let normal_req = ServiceRequest::new(svc, agent_token.clone(), serde_json::json!({ "wire_id": "WIRE-POST" }), None);
+    let normal_req = ServiceRequest::new(
+        svc,
+        agent_token.clone(),
+        serde_json::json!({ "wire_id": "WIRE-POST" }),
+        None,
+    );
     let normal_receipt = engine.submit_service_request(normal_req).await.unwrap();
     println!(
         "    + Post-recovery request returned to normal baseline ETA: {}s\n",
