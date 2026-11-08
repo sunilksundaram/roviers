@@ -125,6 +125,7 @@ impl RoviersEngine {
 
         let mut receipts_map = HashMap::new();
         let mut outcomes_map = HashMap::new();
+        let mut pending_requests_map = HashMap::new();
 
         if let Ok(entries) = std::fs::read_dir(&vault_dir) {
             for entry in entries.flatten() {
@@ -144,9 +145,28 @@ impl RoviersEngine {
                     if let Some(o) = outcome_res {
                         outcomes_map.insert(o.receipt_id, o);
                     }
+                } else if file_name.ends_with(".request.json") {
+                    let req_res = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|data| serde_json::from_str::<ServiceRequest>(&data).ok());
+                    if let Some(req) = req_res {
+                        pending_requests_map.insert(req.request_id, req);
+                    }
                 }
             }
         }
+
+        // Filter pending requests to only non-terminal receipts
+        pending_requests_map.retain(|id, _| {
+            receipts_map.get(id).is_some_and(|r| {
+                matches!(
+                    r.status,
+                    ReceiptStatus::Queued
+                        | ReceiptStatus::Processing
+                        | ReceiptStatus::ParkedAwaitingInput { .. }
+                )
+            })
+        });
 
         // Initialize active business case locks from persisted receipts (Phase 6)
         let mut business_case_locks = HashMap::new();
@@ -207,7 +227,7 @@ impl RoviersEngine {
             dlq: Arc::new(RwLock::new(Vec::new())),
             business_case_locks: Arc::new(RwLock::new(business_case_locks)),
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes_map)),
-            pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            pending_requests: Arc::new(RwLock::new(pending_requests_map)),
             node_id,
             is_leader: true,
             num_partitions,
@@ -285,20 +305,27 @@ impl RoviersEngine {
 
         // Step 2.1: Long-Lived Business Idempotency & Case Leasing (Phase 6)
         if let Some(ref bkey) = request.business_key {
-            let mut locks = self.business_case_locks.write().unwrap();
-            if let Some(&existing_id) = locks.get(bkey) {
-                let receipts = self.receipts.read().unwrap();
-                if let Some(existing_receipt) = receipts.get(&existing_id)
-                    && matches!(
-                        existing_receipt.status,
-                        ReceiptStatus::Queued
-                            | ReceiptStatus::Processing
-                            | ReceiptStatus::ParkedAwaitingInput { .. }
-                    )
-                {
+            let existing_id = {
+                let locks = self.business_case_locks.read().unwrap();
+                locks.get(bkey).copied()
+            };
+            if let Some(existing_id) = existing_id {
+                let is_locked = {
+                    let receipts = self.receipts.read().unwrap();
+                    receipts.get(&existing_id).is_some_and(|existing_receipt| {
+                        matches!(
+                            existing_receipt.status,
+                            ReceiptStatus::Queued
+                                | ReceiptStatus::Processing
+                                | ReceiptStatus::ParkedAwaitingInput { .. }
+                        )
+                    })
+                };
+                if is_locked {
                     return Err(CoreError::BusinessCaseLocked(bkey.clone(), existing_id));
                 }
             }
+            let mut locks = self.business_case_locks.write().unwrap();
             locks.insert(bkey.clone(), request.request_id);
         }
 
@@ -331,14 +358,20 @@ impl RoviersEngine {
             let mut r = self.receipts.write().unwrap();
             r.insert(receipt.receipt_id, receipt.clone());
         }
-        self.pending_requests.write().unwrap().insert(receipt.receipt_id, request);
+        self.pending_requests.write().unwrap().insert(receipt.receipt_id, request.clone());
 
-        // Persist receipt to disk vault
+        // Persist receipt and request to disk vault
         let receipt_path = self
             .vault_dir
             .join(format!("{}.receipt.json", receipt.receipt_id));
         if let Ok(data) = serde_json::to_string_pretty(&receipt) {
             let _ = std::fs::write(receipt_path, data);
+        }
+        let request_path = self
+            .vault_dir
+            .join(format!("{}.request.json", receipt.receipt_id));
+        if let Ok(data) = serde_json::to_string_pretty(&request) {
+            let _ = std::fs::write(request_path, data);
         }
 
         // Step 5: Notify workers through topic routing trie
@@ -404,6 +437,7 @@ impl RoviersEngine {
             locks.remove(bkey);
         }
         self.pending_requests.write().unwrap().remove(&receipt_id);
+        let _ = std::fs::remove_file(self.vault_dir.join(format!("{}.request.json", receipt_id)));
 
         // Emit AgentSignal over the notification bus (SSE)
         let signal = AgentSignal {
@@ -640,52 +674,58 @@ impl RoviersEngine {
     ) -> Result<Receipt, CoreError> {
         let creds = token.verify(&self.broker_verifying_key)?;
 
-        let mut receipts = self.receipts.write().unwrap();
-        let receipt = receipts
-            .get_mut(&receipt_id)
-            .ok_or(CoreError::ReceiptNotFound(receipt_id))?;
-
-        if receipt.agent_id != creds.agent_id {
-            return Err(CoreError::AgentMismatch);
-        }
-
         let cancel_reason = reason.unwrap_or_else(|| "Client/Agent requested cancellation".into());
-        receipt.status = ReceiptStatus::Failed(format!("Cancelled: {}", cancel_reason));
+        let (updated_receipt, bkey_to_release) = {
+            let mut receipts = self.receipts.write().unwrap();
+            let receipt = receipts
+                .get_mut(&receipt_id)
+                .ok_or(CoreError::ReceiptNotFound(receipt_id))?;
 
-        // Persist to disk vault
-        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
-        if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
-            let _ = std::fs::write(receipt_path, data);
-        }
+            if receipt.agent_id != creds.agent_id {
+                return Err(CoreError::AgentMismatch);
+            }
+
+            receipt.status = ReceiptStatus::Failed(format!("Cancelled: {}", cancel_reason));
+
+            // Persist to disk vault
+            let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
+            if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+                let _ = std::fs::write(receipt_path, data);
+            }
+
+            (receipt.clone(), receipt.business_key.clone())
+        };
 
         // Release business case lock upon cancellation (Phase 6)
-        if let Some(ref bkey) = receipt.business_key {
+        if let Some(ref bkey) = bkey_to_release {
             let mut locks = self.business_case_locks.write().unwrap();
             locks.remove(bkey);
         }
+        self.pending_requests.write().unwrap().remove(&receipt_id);
+        let _ = std::fs::remove_file(self.vault_dir.join(format!("{}.request.json", receipt_id)));
 
         let signal = AgentSignal {
             signal_id: Uuid::now_v7(),
             receipt_id,
             agent_id: creds.agent_id.clone(),
-            service_name: receipt.service_name.clone(),
-            status: receipt.status.clone(),
+            service_name: updated_receipt.service_name.clone(),
+            status: updated_receipt.status.clone(),
             message: format!("Task cancelled: {}", cancel_reason),
             pickup_url: format!("/api/v1/receipts/{}", receipt_id),
             timestamp: Utc::now().timestamp(),
-            tenant_id: receipt.tenant_id.clone(),
-            session_id: receipt.session_id.clone(),
-            business_key: receipt.business_key.clone(),
-            traceparent: receipt.traceparent.clone(),
-            tracestate: receipt.tracestate.clone(),
-            partition_id: receipt.partition_id,
+            tenant_id: updated_receipt.tenant_id.clone(),
+            session_id: updated_receipt.session_id.clone(),
+            business_key: updated_receipt.business_key.clone(),
+            traceparent: updated_receipt.traceparent.clone(),
+            tracestate: updated_receipt.tracestate.clone(),
+            partition_id: updated_receipt.partition_id,
         };
 
         let _ = self.signal_bus.send(signal);
 
         tracing::info!("Receipt {} cancelled: {}", receipt_id, cancel_reason);
 
-        Ok(receipt.clone())
+        Ok(updated_receipt)
     }
 
     /// Dynamically trip or set backoff for a downstream service (e.g. slow legacy ERP, rate-limited API).
@@ -874,56 +914,82 @@ impl RoviersEngine {
         }
 
         let mut reclaimed_tasks = Vec::new();
-        let mut receipts = self.receipts.write().unwrap();
-        let mut dlq = self.dlq.write().unwrap();
+        let mut bkeys_to_release = Vec::new();
+        let mut dead_lettered_ids = Vec::new();
+        let mut signals_to_send = Vec::new();
 
-        for lease in expired_leases {
-            for task_id in lease.task_ids {
-                if let Some(receipt) = receipts.get_mut(&task_id)
-                    && receipt.status == ReceiptStatus::Processing
-                {
-                    receipt.delivery_attempts += 1;
-                    if receipt.delivery_attempts >= 3 {
-                        let fail_msg = format!(
-                            "Exceeded max delivery attempts ({}). Diverted to Dead Letter Queue (DLQ).",
-                            receipt.delivery_attempts
-                        );
-                        receipt.status = ReceiptStatus::Failed(fail_msg.clone());
-                        dlq.push(receipt.clone());
+        {
+            let mut receipts = self.receipts.write().unwrap();
+            let mut dlq = self.dlq.write().unwrap();
 
-                        if let Some(ref bkey) = receipt.business_key {
-                            let mut locks = self.business_case_locks.write().unwrap();
-                            locks.remove(bkey);
+            for lease in expired_leases {
+                for task_id in lease.task_ids {
+                    if let Some(receipt) = receipts.get_mut(&task_id)
+                        && receipt.status == ReceiptStatus::Processing
+                    {
+                        receipt.delivery_attempts += 1;
+                        if receipt.delivery_attempts >= 3 {
+                            let fail_msg = format!(
+                                "Exceeded max delivery attempts ({}). Diverted to Dead Letter Queue (DLQ).",
+                                receipt.delivery_attempts
+                            );
+                            receipt.status = ReceiptStatus::Failed(fail_msg.clone());
+                            dlq.push(receipt.clone());
+                            dead_lettered_ids.push(task_id);
+
+                            if let Some(ref bkey) = receipt.business_key {
+                                bkeys_to_release.push(bkey.clone());
+                            }
+
+                            signals_to_send.push(AgentSignal {
+                                signal_id: Uuid::now_v7(),
+                                receipt_id: task_id,
+                                agent_id: receipt.agent_id.clone(),
+                                service_name: receipt.service_name.clone(),
+                                status: receipt.status.clone(),
+                                message: fail_msg,
+                                pickup_url: format!("/api/v1/receipts/{}", task_id),
+                                timestamp: now,
+                                tenant_id: receipt.tenant_id.clone(),
+                                session_id: receipt.session_id.clone(),
+                                business_key: receipt.business_key.clone(),
+                                traceparent: receipt.traceparent.clone(),
+                                tracestate: receipt.tracestate.clone(),
+                                partition_id: receipt.partition_id,
+                            });
+                        } else {
+                            receipt.status = ReceiptStatus::Queued;
+                            reclaimed_tasks.push(task_id);
                         }
 
-                        let signal = AgentSignal {
-                            signal_id: Uuid::now_v7(),
-                            receipt_id: task_id,
-                            agent_id: receipt.agent_id.clone(),
-                            service_name: receipt.service_name.clone(),
-                            status: receipt.status.clone(),
-                            message: fail_msg,
-                            pickup_url: format!("/api/v1/receipts/{}", task_id),
-                            timestamp: now,
-                            tenant_id: receipt.tenant_id.clone(),
-                            session_id: receipt.session_id.clone(),
-                            business_key: receipt.business_key.clone(),
-                            traceparent: receipt.traceparent.clone(),
-                            tracestate: receipt.tracestate.clone(),
-                            partition_id: receipt.partition_id,
-                        };
-                        let _ = self.signal_bus.send(signal);
-                    } else {
-                        receipt.status = ReceiptStatus::Queued;
-                        reclaimed_tasks.push(task_id);
-                    }
-
-                    let receipt_path = self.vault_dir.join(format!("{}.receipt.json", task_id));
-                    if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
-                        let _ = std::fs::write(receipt_path, data);
+                        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", task_id));
+                        if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+                            let _ = std::fs::write(receipt_path, data);
+                        }
                     }
                 }
             }
+        }
+
+        // Release business keys without holding receipts lock
+        if !bkeys_to_release.is_empty() {
+            let mut locks = self.business_case_locks.write().unwrap();
+            for bkey in bkeys_to_release {
+                locks.remove(&bkey);
+            }
+        }
+
+        // Clean up pending requests and request files for dead-lettered tasks
+        if !dead_lettered_ids.is_empty() {
+            let mut pending = self.pending_requests.write().unwrap();
+            for task_id in dead_lettered_ids {
+                pending.remove(&task_id);
+                let _ = std::fs::remove_file(self.vault_dir.join(format!("{}.request.json", task_id)));
+            }
+        }
+
+        for signal in signals_to_send {
+            let _ = self.signal_bus.send(signal);
         }
 
         reclaimed_tasks
@@ -1077,27 +1143,35 @@ impl RoviersEngine {
         }
 
         let mut purged_count = 0;
-        let mut receipts = self.receipts.write().unwrap();
-        let mut outcomes = self.outcomes.write().unwrap();
+        {
+            let mut receipts = self.receipts.write().unwrap();
+            let mut outcomes = self.outcomes.write().unwrap();
+            let mut pending = self.pending_requests.write().unwrap();
+
+            for (id, _) in &to_purge {
+                receipts.remove(id);
+                outcomes.remove(id);
+                pending.remove(id);
+
+                // Remove files from vault disk
+                let receipt_file = self.vault_dir.join(format!("{}.receipt.json", id));
+                let outcome_file = self.vault_dir.join(format!("{}.outcome.json", id));
+                let request_file = self.vault_dir.join(format!("{}.request.json", id));
+                let _ = std::fs::remove_file(receipt_file);
+                let _ = std::fs::remove_file(outcome_file);
+                let _ = std::fs::remove_file(request_file);
+
+                purged_count += 1;
+            }
+        }
+
         let mut locks = self.business_case_locks.write().unwrap();
-
         for (id, bkey) in to_purge {
-            receipts.remove(&id);
-            outcomes.remove(&id);
-
             if let Some(ref k) = bkey
                 && locks.get(k) == Some(&id)
             {
                 locks.remove(k);
             }
-
-            // Remove files from vault disk
-            let receipt_file = self.vault_dir.join(format!("{}.receipt.json", id));
-            let outcome_file = self.vault_dir.join(format!("{}.outcome.json", id));
-            let _ = std::fs::remove_file(receipt_file);
-            let _ = std::fs::remove_file(outcome_file);
-
-            purged_count += 1;
         }
 
         purged_count
@@ -1198,9 +1272,10 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("roviers_vault_test_{}", Uuid::now_v7()));
 
         let req_id;
+        let queued_req_id;
         let agent_token;
 
-        // Session 1: Engine starts, creates key, accepts request, completes outcome
+        // Session 1: Engine starts, creates key, accepts requests, completes one and leaves one queued
         {
             let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
             agent_token = engine
@@ -1219,6 +1294,18 @@ mod tests {
                 .submit_service_request(request)
                 .await
                 .expect("Failed to submit");
+
+            let queued_request = ServiceRequest::new(
+                "computation.analytic_engine",
+                agent_token.clone(),
+                serde_json::json!({ "algorithm": "diffie_hellman", "key_size": 2048 }),
+                None,
+            );
+            queued_req_id = queued_request.request_id;
+            engine
+                .submit_service_request(queued_request)
+                .await
+                .expect("Failed to submit queued request");
 
             let outcome = ServiceOutcome {
                 receipt_id: req_id,
@@ -1256,6 +1343,25 @@ mod tests {
 
             let fulfilled_receipt = engine2.get_receipt(req_id).unwrap();
             assert_eq!(fulfilled_receipt.status, ReceiptStatus::Fulfilled);
+
+            // Verify queued request persisted in pending_requests and can be leased with full payload!
+            let lease_resp = engine2
+                .lease_tasks(
+                    WorkerLeaseRequest {
+                        worker_id: "worker-recovery-test".into(),
+                        service_filter: None,
+                        max_tasks: 10,
+                        available_tpm_budget: None,
+                        active_inflight: 0,
+                    },
+                    30,
+                )
+                .expect("Failed to lease tasks after restart");
+
+            assert_eq!(lease_resp.granted_tasks.len(), 1);
+            let leased_task = &lease_resp.granted_tasks[0];
+            assert_eq!(leased_task.request_id, queued_req_id);
+            assert_eq!(leased_task.payload["algorithm"], "diffie_hellman");
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);

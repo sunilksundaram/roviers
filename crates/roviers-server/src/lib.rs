@@ -1,10 +1,11 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
+use tower_http::cors::{Any, CorsLayer};
 use futures::stream::Stream;
 use roviers_core::RoviersEngine;
 use roviers_proto::{
@@ -64,6 +65,11 @@ pub struct CompactVaultRequest {
 
 pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
     let state = AppState { engine };
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     Router::new()
         .route("/health", get(health_check))
@@ -134,6 +140,8 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
             "/api/v1/citizens/{citizen_id}/receipts",
             get(list_citizen_receipts),
         )
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .with_state(state)
 }
 
