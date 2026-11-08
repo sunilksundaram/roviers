@@ -520,6 +520,24 @@ export class RoviersBrokerClient {
   }
 
   /**
+   * Compact / purge expired completed or failed receipts and outcomes from vault.
+   */
+  async compactVault(maxAgeSecs: number = 86400): Promise<{ status: string; purged_receipts: number; max_age_secs: number }> {
+    const res = await fetch(`${this.baseUrl}/api/v1/vault/compact`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_age_secs: maxAgeSecs }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Vault compaction failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as { status: string; purged_receipts: number; max_age_secs: number };
+  }
+
+  /**
    * Worker method: deposit finished task outcome into the Broker Vault.
    */
   async complete<T = any>(receiptId: string, result: T, blobRef?: BlobReference): Promise<void> {

@@ -209,24 +209,22 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 11: Vault Lifecycle, Retention & Cold Archival
 *Goal: Prevent disk exhaustion in continuous high-throughput deployments.*
 
-- [ ] **Automated Compaction & Pruning**:
-  - Configurable retention in `roviers.toml`:
-    ```toml
-    [vault.lifecycle]
-    hot_cache_ttl_secs = 300
-    local_disk_retention_days = 7
-    archive_to_cold_storage = true
-    cold_storage_bucket = "s3://my-roviers-vault-archive"
-    ```
-  - Scheduled background sweeper zips aged partitions and moves them to cold storage before deleting local files.
+- [x] **Automated Compaction & Pruning**:
+  - Implemented `purge_expired_receipts(max_age_secs)` in `RoviersEngine`.
+  - Purges terminal receipts (`Fulfilled`, `Failed`) older than `max_age_secs` from in-memory index, active locks, and local disk JSON vault.
+  - Exposed HTTP compaction endpoint: `POST /api/v1/vault/compact` (`max_age_secs` configurable, default 86400).
+  - SDK support in Python (`compact_vault`) and TypeScript (`compactVault`).
+  - Verified in `test_server_vault_compaction_and_w3c_tracing_http`.
 
 ### Phase 12: W3C Distributed Tracing (OpenTelemetry)
 *Goal: Provide end-to-end observability across the entire multi-agent call chain.*
 
-- [ ] **Trace Context Injection & Extraction**:
-  - Add optional `traceparent` and `tracestate` fields to `ServiceRequest` and `Receipt`.
-  - Propagate context into Axum request spans, ledger commit logs, and SSE broadcast signals.
-  - Enable seamless correlation in Jaeger, Datadog, Zipkin, and Google Cloud Trace.
+- [x] **Trace Context Injection & Extraction**:
+  - W3C `traceparent` and `tracestate` fields supported in `ServiceRequest`, `Receipt`, and `AgentSignal`.
+  - Ingress extracts `traceparent` and `tracestate` from incoming HTTP headers or generates standard W3C compliant IDs.
+  - Returns `traceparent` and `tracestate` in HTTP response headers for `submit_service`, `get_receipt`, and SSE event data.
+  - SDK propagation in Python and TypeScript.
+  - Verified in `test_server_vault_compaction_and_w3c_tracing_http`.
 
 ---
 

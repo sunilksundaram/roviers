@@ -347,6 +347,18 @@ class RoviersBrokerClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def compact_vault(self, max_age_secs: int = 86400) -> Dict[str, Any]:
+        """
+        Compacts the outcome vault by purging terminal (fulfilled/failed) receipts older than max_age_secs.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/vault/compact",
+                json={"max_age_secs": max_age_secs},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def complete(self, receipt_id: str, result: Any, blob_ref: Optional[Dict[str, Any]] = None) -> None:
         """
         Worker capability: deposits a finished execution outcome into the Vault.

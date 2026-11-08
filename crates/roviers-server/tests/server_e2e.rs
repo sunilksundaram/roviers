@@ -955,3 +955,162 @@ async fn test_server_case_locking_and_cluster_http() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_server_vault_compaction_and_w3c_tracing_http() {
+    let temp_dir = std::env::temp_dir().join(format!("roviers_compaction_w3c_test_{}", Uuid::now_v7()));
+    let engine = Arc::new(RoviersEngine::new(&temp_dir).expect("Failed to init engine"));
+    let app = create_app(Arc::clone(&engine));
+
+    // 1. Issue Agent Token
+    let auth_body = serde_json::to_vec(&serde_json::json!({
+        "agent_id": "AGENT-TRACE-01",
+        "agent_name": "Trace Agent",
+        "validity_days": 30
+    }))
+    .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/agent")
+                .header("content-type", "application/json")
+                .body(Body::from(auth_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let token: SignedAgentToken = serde_json::from_slice(&bytes).unwrap();
+
+    // 2. Submit service request with W3C traceparent header (Phase 12)
+    let traceparent_val = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let tracestate_val = "congo=t61rcWkgMzE";
+
+    let req = ServiceRequest::new(
+        "telemetry.trace_span",
+        token.clone(),
+        serde_json::json!({ "span": "order_checkout" }),
+        None,
+    );
+    let req_id = req.request_id;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/services/telemetry.trace_span")
+                .header("content-type", "application/json")
+                .header("traceparent", traceparent_val)
+                .header("tracestate", tracestate_val)
+                .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+    // Verify traceparent is present in HTTP response headers
+    let resp_traceparent = res.headers().get("traceparent").unwrap().to_str().unwrap();
+    assert_eq!(resp_traceparent, traceparent_val);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let receipt: Receipt = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(receipt.traceparent.as_deref(), Some(traceparent_val));
+    assert_eq!(receipt.tracestate.as_deref(), Some(tracestate_val));
+
+    // 3. GET /api/v1/receipts/{id} returns traceparent in HTTP header
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/receipts/{}", req_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get("traceparent").unwrap().to_str().unwrap(),
+        traceparent_val
+    );
+
+    // 4. Complete service
+    let complete_body = serde_json::to_vec(&serde_json::json!({
+        "result": { "status": "ORDER_CONFIRMED" }
+    }))
+    .unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/receipts/{}/complete", req_id))
+                .header("content-type", "application/json")
+                .body(Body::from(complete_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 5. Pickup outcome
+    let pickup_body = serde_json::to_vec(&serde_json::json!({ "agent_token": token })).unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/receipts/{}/pickup", req_id))
+                .header("content-type", "application/json")
+                .body(Body::from(pickup_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 6. Test Vault Compaction (Phase 11): POST /api/v1/vault/compact
+    let compact_body = serde_json::to_vec(&serde_json::json!({
+        "max_age_secs": 0
+    }))
+    .unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/compact")
+                .header("content-type", "application/json")
+                .body(Body::from(compact_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let compact_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(compact_resp["purged_receipts"], 1);
+
+    // 7. Verify receipt is purged
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/receipts/{}", req_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
@@ -56,6 +56,12 @@ pub struct CompleteRequest {
     pub blob_ref: Option<BlobReference>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct CompactVaultRequest {
+    #[serde(default)]
+    pub max_age_secs: Option<i64>,
+}
+
 pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
     let state = AppState { engine };
 
@@ -101,6 +107,8 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
         .route("/api/v1/cluster/heartbeat", post(cluster_peer_heartbeat))
         // Dead Letter Queue
         .route("/api/v1/dlq", get(list_dlq))
+        // Vault Lifecycle & Compaction
+        .route("/api/v1/vault/compact", post(compact_vault))
         // SSE Real-Time Completion Signals
         .route(
             "/api/v1/agents/{agent_id}/stream",
@@ -151,12 +159,42 @@ pub async fn issue_agent_token(
 pub async fn submit_service(
     State(state): State<AppState>,
     Path(service_name): Path<String>,
+    headers: HeaderMap,
     Json(mut req): Json<ServiceRequest>,
-) -> Result<(StatusCode, Json<Receipt>), (StatusCode, String)> {
+) -> Result<(StatusCode, HeaderMap, Json<Receipt>), (StatusCode, String)> {
     req.service_name = service_name;
 
+    // Phase 12: W3C Distributed Tracing propagation
+    if req.traceparent.is_none() {
+        if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
+            req.traceparent = Some(tp.to_string());
+        } else {
+            let trace_id = format!("{:032x}", rand::random::<u128>());
+            let parent_id = format!("{:016x}", rand::random::<u64>());
+            req.traceparent = Some(format!("00-{}-{}-01", trace_id, parent_id));
+        }
+    }
+    if req.tracestate.is_none()
+        && let Some(ts) = headers.get("tracestate").and_then(|v| v.to_str().ok())
+    {
+        req.tracestate = Some(ts.to_string());
+    }
+
     match state.engine.submit_service_request(req).await {
-        Ok(receipt) => Ok((StatusCode::ACCEPTED, Json(receipt))),
+        Ok(receipt) => {
+            let mut resp_headers = HeaderMap::new();
+            if let Some(ref tp) = receipt.traceparent
+                && let Ok(val) = HeaderValue::from_str(tp)
+            {
+                resp_headers.insert("traceparent", val);
+            }
+            if let Some(ref ts) = receipt.tracestate
+                && let Ok(val) = HeaderValue::from_str(ts)
+            {
+                resp_headers.insert("tracestate", val);
+            }
+            Ok((StatusCode::ACCEPTED, resp_headers, Json(receipt)))
+        }
         Err(roviers_core::CoreError::Auth(e)) => Err((StatusCode::UNAUTHORIZED, e.to_string())),
         Err(roviers_core::CoreError::DuplicateRequest(id)) => {
             Err((StatusCode::CONFLICT, format!("Duplicate request: {}", id)))
@@ -231,12 +269,20 @@ pub async fn get_service_status(
 pub async fn get_receipt(
     State(state): State<AppState>,
     Path(receipt_id): Path<Uuid>,
-) -> Result<Json<Receipt>, StatusCode> {
-    state
-        .engine
-        .get_receipt(receipt_id)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+) -> Result<(HeaderMap, Json<Receipt>), StatusCode> {
+    let receipt = state.engine.get_receipt(receipt_id).ok_or(StatusCode::NOT_FOUND)?;
+    let mut resp_headers = HeaderMap::new();
+    if let Some(ref tp) = receipt.traceparent
+        && let Ok(val) = HeaderValue::from_str(tp)
+    {
+        resp_headers.insert("traceparent", val);
+    }
+    if let Some(ref ts) = receipt.tracestate
+        && let Ok(val) = HeaderValue::from_str(ts)
+    {
+        resp_headers.insert("tracestate", val);
+    }
+    Ok((resp_headers, Json(receipt)))
 }
 
 /// Pickup outcome by presenting the receipt ID and Agent token
@@ -389,6 +435,23 @@ pub async fn reclaim_expired_leases(State(state): State<AppState>) -> Json<Vec<U
 pub async fn list_dlq(State(state): State<AppState>) -> Json<Vec<Receipt>> {
     let dlq = state.engine.list_dlq();
     Json(dlq)
+}
+
+/// Compact / purge expired completed or failed receipts and outcomes from vault (Phase 11)
+pub async fn compact_vault(
+    State(state): State<AppState>,
+    Json(req): Json<CompactVaultRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let max_age = req.max_age_secs.unwrap_or(86400);
+    let purged = state.engine.purge_expired_receipts(max_age);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "purged_receipts": purged,
+            "max_age_secs": max_age
+        })),
+    )
 }
 
 /// List all active receipts for an agent
