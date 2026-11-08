@@ -10,7 +10,7 @@ readme = "README.md"
 description = "Append-only memory-mapped commit log, radix topic trie, and deduplication engine for Roviers"
 
 [dependencies]
-roviers-proto = { path = "../roviers-proto", version = "0.1.0" }
+roviers-proto = { path = "../roviers-proto", version = "0.2.0" }
 crc32fast.workspace = true
 memmap2.workspace = true
 lz4_flex.workspace = true

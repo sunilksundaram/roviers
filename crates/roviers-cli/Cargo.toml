@@ -10,7 +10,7 @@ readme = "README.md"
 description = "Command-line interface client and management tool for the Roviers Broker"
 
 [dependencies]
-roviers-proto = { path = "../roviers-proto", version = "0.1.0" }
+roviers-proto = { path = "../roviers-proto", version = "0.2.0" }
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true

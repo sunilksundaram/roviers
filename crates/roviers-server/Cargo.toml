@@ -10,9 +10,9 @@ readme = "README.md"
 description = "High-performance Axum HTTP & SSE broker server daemon for Roviers"
 
 [dependencies]
-roviers-proto = { path = "../roviers-proto", version = "0.1.0" }
-roviers-ledger = { path = "../roviers-ledger", version = "0.1.0" }
-roviers-core = { path = "../roviers-core", version = "0.1.0" }
+roviers-proto = { path = "../roviers-proto", version = "0.2.0" }
+roviers-ledger = { path = "../roviers-ledger", version = "0.2.0" }
+roviers-core = { path = "../roviers-core", version = "0.2.0" }
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true

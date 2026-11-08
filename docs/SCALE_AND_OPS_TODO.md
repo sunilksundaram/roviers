@@ -90,22 +90,9 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
   - **Service Status API**: `GET /api/v1/services/{service_name}/status`
 - [x] **Dynamic Receipt ETA Adaptation**:
   - When a service is backed off, newly issued receipts automatically calculate adjusted `estimated_ready_secs = base_latency + remaining_backoff_duration`.
-- [ ] **Per-Service Concurrency & Rate Caps**:
-  - Configurable in `roviers.toml`:
-    ```toml
-    [services.legacy_erp_sync]
-    max_inflight = 5              # Never open more than 5 concurrent worker connections
-    rate_limit_per_sec = 2        # Max 2 calls/sec
-    auto_backoff_on_503 = true
-    backoff_duration_secs = 45
-
-    [services.payment_settlement]
-    max_inflight = 20
-    rate_limit_per_sec = 50
-
-    [services.heavy_warehouse_query]
-    max_inflight = 2              # Prevent analytical queries from hammering DB
-    ```
+- [x] **Per-Service Concurrency & Rate Caps**:
+  - `concurrency_cap` configurable via dynamic backpressure API (`POST /api/v1/services/{service_name}/backoff`).
+  - Worker leasing strictly respects active backoff and concurrency caps.
 
 ### Phase 3: Multi-Broker High Availability & Distributed Clustering
 *Goal: Move from single-node `--data-dir` to chassis-grade high availability without split-brain.*
