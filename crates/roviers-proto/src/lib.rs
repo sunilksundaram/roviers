@@ -14,6 +14,8 @@ pub enum ProtoError {
     Serialization(#[from] serde_json::Error),
     #[error("Invalid key format: {0}")]
     KeyError(String),
+    #[error("Resume token has expired at {0}")]
+    ResumeTokenExpired(i64),
 }
 
 /// The verified agent identity payload
@@ -90,6 +92,14 @@ impl SignedAgentToken {
     }
 }
 
+/// Session turn correlation for multi-turn Human-In-The-Loop (HITL) workflows
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTurn {
+    pub session_id: String,
+    pub turn_id: u64,
+    pub parent_receipt_id: Option<Uuid>,
+}
+
 /// Service request presented to the Broker ingress
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRequest {
@@ -98,6 +108,8 @@ pub struct ServiceRequest {
     pub agent_token: SignedAgentToken,
     pub payload: serde_json::Value,
     pub callback_url: Option<String>,
+    #[serde(default)]
+    pub session_turn: Option<SessionTurn>,
 }
 
 impl ServiceRequest {
@@ -113,7 +125,17 @@ impl ServiceRequest {
             agent_token,
             payload,
             callback_url,
+            session_turn: None,
         }
+    }
+
+    pub fn with_session(mut self, session_id: impl Into<String>, turn_id: u64, parent: Option<Uuid>) -> Self {
+        self.session_turn = Some(SessionTurn {
+            session_id: session_id.into(),
+            turn_id,
+            parent_receipt_id: parent,
+        });
+        self
     }
 }
 
@@ -122,9 +144,96 @@ impl ServiceRequest {
 pub enum ReceiptStatus {
     Queued,
     Processing,
+    ParkedAwaitingInput {
+        question: String,
+        schema_for_answer: Option<serde_json::Value>,
+    },
     ReadyForPickup,
     Fulfilled,
     Failed(String),
+}
+
+/// The verifiable cryptographic resumption token issued when an agent parks for HITL input
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumePayload {
+    pub session_id: String,
+    pub turn_id: u64,
+    pub receipt_id: Uuid,
+    pub question: String,
+    pub schema_for_answer: Option<serde_json::Value>,
+    pub checkpoint_uri: Option<String>,
+    pub expires_at: i64,
+}
+
+impl ResumePayload {
+    pub fn is_expired(&self) -> bool {
+        Utc::now().timestamp() > self.expires_at
+    }
+}
+
+/// Cryptographically signed resume token (Stateless HITL continuation)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedResumeToken {
+    pub payload: ResumePayload,
+    pub signature_bytes: Vec<u8>,
+}
+
+impl SignedResumeToken {
+    pub fn issue(payload: ResumePayload, signing_key: &SigningKey) -> Result<Self, ProtoError> {
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let signature = signing_key.sign(&payload_bytes);
+        Ok(Self {
+            payload,
+            signature_bytes: signature.to_bytes().to_vec(),
+        })
+    }
+
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<&ResumePayload, ProtoError> {
+        let payload_bytes = serde_json::to_vec(&self.payload)?;
+        let sig_bytes: [u8; 64] = self
+            .signature_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProtoError::InvalidSignature("Signature must be 64 bytes".into()))?;
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        verifying_key
+            .verify(&payload_bytes, &signature)
+            .map_err(|e| ProtoError::InvalidSignature(e.to_string()))?;
+
+        if self.payload.is_expired() {
+            return Err(ProtoError::ResumeTokenExpired(self.payload.expires_at));
+        }
+
+        Ok(&self.payload)
+    }
+}
+
+/// Request to resume a parked HITL turn with user input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResumeRequest {
+    pub resume_token: SignedResumeToken,
+    pub answer: serde_json::Value,
+    pub agent_token: SignedAgentToken,
+}
+
+/// Worker capacity lease request to prevent LLM quota stampedes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLeaseRequest {
+    pub worker_id: String,
+    pub service_filter: Option<String>,
+    pub max_tasks: usize,
+    pub available_tpm_budget: Option<u64>,
+    pub active_inflight: usize,
+}
+
+/// Granted lease of tasks for a worker node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLeaseResponse {
+    pub lease_id: Uuid,
+    pub worker_id: String,
+    pub granted_tasks: Vec<ServiceRequest>,
+    pub lease_expires_at: i64,
 }
 
 /// Receipt (The Claim-Check token given to the agent)
@@ -223,5 +332,21 @@ mod tests {
             Err(ProtoError::TokenExpired(_)) => {}
             other => panic!("Expected TokenExpired, got {:?}", other),
         }
+
+        // 5. Test SignedResumeToken lifecycle
+        let resume_payload = ResumePayload {
+            session_id: "SESSION-99".into(),
+            turn_id: 2,
+            receipt_id: Uuid::now_v7(),
+            question: "Please confirm invoice total?".into(),
+            schema_for_answer: None,
+            checkpoint_uri: Some("vault://checkpoints/SESSION-99/turn-1.json".into()),
+            expires_at: Utc::now().timestamp() + 3600,
+        };
+        let resume_token = SignedResumeToken::issue(resume_payload.clone(), &signing_key)
+            .expect("Failed to issue resume token");
+        let verified_resume = resume_token.verify(&verifying_key).expect("Resume token verify failed");
+        assert_eq!(verified_resume.session_id, "SESSION-99");
+        assert_eq!(verified_resume.turn_id, 2);
     }
 }

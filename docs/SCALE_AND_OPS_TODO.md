@@ -15,6 +15,11 @@ This document tracks identified architectural gaps, real-world multi-agent failu
 | **GAP-5** | **Business Key Idempotency** | Sliding window ring-buffer (default 1M entries, ~60s retention under heavy burst). | Transient retries succeed, but multi-hour / multi-day business processes ("one open claim per user session") cannot be enforced. | Persistent Business Case Leasing (`business_key` + distributed lease lock with configurable TTL up to 30 days). |
 | **GAP-6** | **LLM Quota Stampedes & Backpressure** | Roviers accepts all requests up to broker network/disk I/O ceiling. | Workers concurrently picking tasks stampede upstream LLM rate limits (Azure OpenAI TPM/RPM, Apister inflight limits), triggering cascading 429 errors. | Quota-aware admission control, token-bucket rate limiters per upstream model, and worker capacity leases. |
 | **GAP-7** | **Benchmark Realism & Sizing** | Raw ingestion/SSE tested at 100k+ ops/sec. | Ingress throughput gives a false sense of capacity; actual system throughput is constrained by LLM inference (10-50 turns/sec/cluster). | Tiered benchmark suite distinguishing **Broker Ingress Throughput** from **Chassis End-to-End Orchestration Capacity**. |
+| **GAP-8** | **Worker Crash, Lease Expiration & DLQ** | No worker heartbeat or lease timeout on in-flight tasks. | Worker crash (Kubernetes OOMKill, spot eviction) leaves task stuck in `Processing` forever; poison pills crash repeated workers in an infinite loop. | Ephemeral worker leases with heartbeat renewal (`keepalive`), automatic lease reclaim, and Dead Letter Queue (DLQ) after $N$ failed attempts. |
+| **GAP-9** | **In-Flight Cancellation & Client Abort** | No mechanism to cancel a running task or revoke an issued receipt. | User cancels prompt in UI or evaluator prunes an agent branch, but worker continues expensive 30s LLM inference loop, burning quota. | First-class cancellation API (`POST /receipts/{id}/cancel`), SSE `AbortSignal` broadcast, and cooperative token cancellation in client SDKs. |
+| **GAP-10** | **Multi-Tenant Fair Queuing (Noisy Neighbors)** | Global FIFO queue for all incoming service requests. | One tenant dumping 50,000 batch indexing jobs completely starves another tenant's real-time interactive user turns. | Multi-tenant Deficit Round-Robin (DRR) / Weighted Fair Queuing (WFQ) ensuring guaranteed fair-share worker dispatch per tenant. |
+| **GAP-11** | **Vault Retention, Compaction & Lifecycle GC** | Vault files accumulate indefinitely on disk. | High-throughput production clusters run out of disk inodes and storage capacity over weeks/months of operation. | Automated retention & compaction engine: hot in-memory $\to$ warm local disk $\to$ cold compressed S3/GCS archive $\to$ TTL purge. |
+| **GAP-12** | **End-to-End Distributed Tracing (W3C)** | Tracing is internal to server log spans. | Cannot correlate a slow or failed turn across User UI $\to$ Gateway $\to$ Roviers $\to$ Worker $\to$ LLM/APISTER $\to$ SSE. | Propagate W3C `traceparent` and `tracestate` across `ServiceRequest`, `Receipt`, and `AgentSignal` into OpenTelemetry collectors. |
 
 ---
 
@@ -34,6 +39,20 @@ User A sends answer ───► Gateway ───► Worker 2 (Agent 2) ──�
          50 Worker Nodes pull simultaneously
                      │
           All call Azure OpenAI (TPM: 120k) ──► 💥 Cascading HTTP 429 Too Many Requests!
+
+[FAILURE SCENARIO 3: Worker Node Crash & Zombie Tasks]
+Client ────► Roviers (Dispatches Task-X) ────► Worker Node A
+                                                    │
+                                     Worker Node A OOMKilled by OS!
+                                                    │
+                                       (Task-X stuck in "Processing")
+                                                    │
+Client polls /status ──► Never completes (Forever pending until manual reset)
+
+[FAILURE SCENARIO 4: Noisy Neighbor Starvation]
+Tenant A dumps 50,000 batch doc-indexing jobs ──┐
+                                                ├──► FIFO Queue ──► Workers 1..10
+Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B waits 15 minutes!)
 ```
 
 ---
@@ -125,30 +144,88 @@ User A sends answer ───► Gateway ───► Worker 2 (Agent 2) ──�
 - [ ] **End-to-End Soak Test Suite**:
   - Add simulated agent workload harness with synthetic 1.5s LLM latency, 2KB prompt payloads, and 5% HITL interruptions to measure real chassis behavior under stress.
 
+### Phase 8: Worker Liveness, Lease Heartbeats & Dead Letter Queue (DLQ)
+*Goal: Automatically recover from worker crashes and isolate poison pill payloads.*
+
+- [ ] **Lease Keepalive & Heartbeat Protocol**:
+  - Workers refresh lease periodically via `POST /api/v1/workers/{worker_id}/heartbeat`.
+  - Default lease TTL: 45 seconds. Broker background sweeper reclaims expired leases and resets task status to `Queued`.
+- [ ] **Dead Letter Queue (DLQ) & Max Retry Guard**:
+  - Track `delivery_attempts` per task.
+  - If a task causes $N \ge 3$ consecutive worker crashes or unhandled panics, immediately move it to `DLQ`.
+  - Deposit a structured error outcome in the Vault so the client receives a deterministic failure notification.
+
+### Phase 9: In-Flight Task Cancellation & Abort Propagation
+*Goal: Stop expensive downstream LLM inference loops when users cancel or navigate away.*
+
+- [ ] **Cancellation API**:
+  - Add `POST /api/v1/receipts/{receipt_id}/cancel` endpoint accepting signed agent credential.
+  - Marks receipt status as `Cancelled`.
+- [ ] **Worker Abort Broadcast**:
+  - Broadcast an `AbortSignal` over internal worker channel / SSE.
+  - Python and TypeScript SDKs attach `AbortController` / `tokio::select!` cancellation triggers to interrupt running LLM API requests and release GPU/TPM quota immediately.
+
+### Phase 10: Multi-Tenant Fair Queuing & Starvation Prevention
+*Goal: Prevent batch workloads from degrading interactive real-time user turns.*
+
+- [ ] **Deficit Round-Robin (DRR) Scheduler**:
+  - Maintain per-tenant queue partitions in memory.
+  - Round-robin task dispatch across tenants with active workloads, ensuring single high-volume tenants cannot consume more than their fair slice of available worker leases.
+- [ ] **Priority Classes**:
+  - Support `Priority::Interactive` vs `Priority::Batch` in `ServiceRequest`.
+
+### Phase 11: Vault Lifecycle, Retention & Cold Archival
+*Goal: Prevent disk exhaustion in continuous high-throughput deployments.*
+
+- [ ] **Automated Compaction & Pruning**:
+  - Configurable retention in `roviers.toml`:
+    ```toml
+    [vault.lifecycle]
+    hot_cache_ttl_secs = 300
+    local_disk_retention_days = 7
+    archive_to_cold_storage = true
+    cold_storage_bucket = "s3://my-roviers-vault-archive"
+    ```
+  - Scheduled background sweeper zips aged partitions and moves them to cold storage before deleting local files.
+
+### Phase 12: W3C Distributed Tracing (OpenTelemetry)
+*Goal: Provide end-to-end observability across the entire multi-agent call chain.*
+
+- [ ] **Trace Context Injection & Extraction**:
+  - Add optional `traceparent` and `tracestate` fields to `ServiceRequest` and `Receipt`.
+  - Propagate context into Axum request spans, ledger commit logs, and SSE broadcast signals.
+  - Enable seamless correlation in Jaeger, Datadog, Zipkin, and Google Cloud Trace.
+
 ---
 
 ## 4. Priority Roadmap
 
 ```
-           Q1 2026: Reliability & HITL
-┌──────────────────────────────────────────────┐
-│  Phase 1: HITL & Session Rendezvous          │
-│  Phase 2: LLM Quota Leases & Backpressure    │
-│  Phase 5: Two-Tier Blob Claim-Check Vault    │
-└──────────────────────┬───────────────────────┘
-                       │
-                       ▼
-           Q2 2026: Scale & Multi-Tenancy
-┌──────────────────────────────────────────────┐
-│  Phase 4: Hierarchical Multi-Tenant SSE      │
-│  Phase 6: Long-Lived Business Idempotency    │
-│  Phase 7: Real-World Soak Benchmarks         │
-└──────────────────────┬───────────────────────┘
-                       │
-                       ▼
+           Q1 2026: Reliability, HITL & Quotas
+┌────────────────────────────────────────────────────────┐
+│  Phase 1: HITL & Session Rendezvous                    │
+│  Phase 2: LLM Quota Leases & Adaptive Backpressure     │
+│  Phase 8: Worker Liveness, Heartbeats & DLQ            │
+│  Phase 9: In-Flight Cancellation & Abort Signals       │
+│  Phase 5: Two-Tier Blob Claim-Check Vault              │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+           Q2 2026: Multi-Tenancy & Operations
+┌────────────────────────────────────────────────────────┐
+│  Phase 4: Hierarchical Multi-Tenant SSE Scoping        │
+│  Phase 6: Long-Lived Business Idempotency & Case Locks │
+│  Phase 10: Multi-Tenant Fair Queuing (Noisy Neighbors) │
+│  Phase 11: Vault Lifecycle, Retention & Cold Archival  │
+│  Phase 12: W3C Distributed Tracing (OpenTelemetry)     │
+│  Phase 7: Real-World Soak Benchmarks                   │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
            Q3 2026: Chassis-Grade HA
-┌──────────────────────────────────────────────┐
-│  Phase 3: Multi-Broker Partition Clustering  │
-│           & Distributed Raft Consensus       │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│  Phase 3: Multi-Broker Partition Clustering            │
+│           & Distributed Raft Consensus                 │
+└────────────────────────────────────────────────────────┘
 ```
+
