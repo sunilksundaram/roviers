@@ -86,7 +86,7 @@ roviers-server --bind 0.0.0.0:8080 --data-dir /var/lib/roviers
 Create `Dockerfile`:
 ```dockerfile
 # Stage 1: Build
-FROM rust:1.82-bookworm AS builder
+FROM rust:bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release -p roviers-server

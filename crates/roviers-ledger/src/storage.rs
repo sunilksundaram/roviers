@@ -216,12 +216,12 @@ impl Ledger {
 
     pub fn read_record(&mut self, target_offset: u64) -> Result<Option<LedgerRecord>, LedgerError> {
         // Find segment containing this offset
-        let segment = match self
+        let (segment_path, base_offset) = match self
             .segments
             .iter()
             .find(|s| target_offset >= s.base_offset && target_offset < s.end_offset)
         {
-            Some(s) => s,
+            Some(s) => (s.path.clone(), s.base_offset),
             None => {
                 // If not found, try reloading mmaps in case new writes occurred
                 self.reload_mmaps()?;
@@ -230,18 +230,28 @@ impl Ledger {
                     .iter()
                     .find(|s| target_offset >= s.base_offset && target_offset < s.end_offset)
                 {
-                    Some(s) => s,
+                    Some(s) => (s.path.clone(), s.base_offset),
                     None => return Ok(None),
                 }
             }
         };
 
-        let mmap = match self.mmaps.get(&segment.path) {
+        let rel_offset = (target_offset - base_offset) as usize;
+
+        // Reload mmap if the file grew since last mapped
+        let needs_reload = match self.mmaps.get(&segment_path) {
+            Some(m) => rel_offset + HEADER_SIZE > m.len(),
+            None => true,
+        };
+        if needs_reload {
+            self.reload_mmaps()?;
+        }
+
+        let mmap = match self.mmaps.get(&segment_path) {
             Some(m) => m,
             None => return Ok(None),
         };
 
-        let rel_offset = (target_offset - segment.base_offset) as usize;
         if rel_offset + HEADER_SIZE > mmap.len() {
             return Ok(None);
         }
@@ -260,6 +270,16 @@ impl Ledger {
 
         let data_start = rel_offset + HEADER_SIZE;
         let data_end = data_start + topic_len + key_len + data_len;
+
+        // Ensure full body is mapped
+        if data_end > mmap.len() {
+            self.reload_mmaps()?;
+        }
+
+        let mmap = match self.mmaps.get(&segment_path) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
 
         if data_end > mmap.len() {
             return Ok(None);
@@ -294,5 +314,52 @@ impl Ledger {
             key: String::from_utf8_lossy(key_bytes).into_owned(),
             payload: decompressed,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ledger_append_and_immediate_read() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roviers_ledger_test_{}", uuid::Uuid::now_v7()));
+        let mut ledger = Ledger::open(&temp_dir, 1024 * 1024).expect("Failed to open ledger");
+
+        let payload_1 = b"Hello Roviers Append-Only World!";
+        let offset_1 = ledger
+            .append("service.ai", "req-1", payload_1)
+            .expect("Append 1 failed");
+
+        let record_1 = ledger
+            .read_record(offset_1)
+            .expect("Read 1 failed")
+            .expect("Record 1 should exist");
+        assert_eq!(record_1.topic, "service.ai");
+        assert_eq!(record_1.key, "req-1");
+        assert_eq!(record_1.payload, payload_1);
+
+        let payload_2 = b"Second contiguous record testing mmap growth";
+        let offset_2 = ledger
+            .append("service.ai", "req-2", payload_2)
+            .expect("Append 2 failed");
+
+        let record_2 = ledger
+            .read_record(offset_2)
+            .expect("Read 2 failed")
+            .expect("Record 2 should exist");
+        assert_eq!(record_2.topic, "service.ai");
+        assert_eq!(record_2.key, "req-2");
+        assert_eq!(record_2.payload, payload_2);
+
+        // Can still read record 1
+        let record_1_again = ledger
+            .read_record(offset_1)
+            .expect("Read 1 again failed")
+            .expect("Record 1 should still exist");
+        assert_eq!(record_1_again.payload, payload_1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
