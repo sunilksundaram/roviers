@@ -7,3 +7,4 @@ Core broker engine, disk-backed outcome vault, ed25519 cryptographic receipts, a
 - Persistent claim-check vault with ed25519 cryptographic signatures
 - Webhook notification delivery with automated retry
 - Real-time agent signal broadcast channels
+

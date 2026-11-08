@@ -7,3 +7,4 @@ Append-only memory-mapped commit log, radix topic trie, and deduplication engine
 - Radix topic trie supporting wildcard pattern matching (`#`, `+`)
 - In-memory circular sliding-window deduplication ring buffer
 - CRC32 verification and optional LZ4 compression
+

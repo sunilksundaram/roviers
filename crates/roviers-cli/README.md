@@ -8,3 +8,4 @@ Command-line client and management tool for **Roviers**.
 - Status and outcome claim-check retrieval (`pickup`)
 - Live agent signal streaming (`listen`)
 - Interactive end-to-end broker demo (`demo`)
+

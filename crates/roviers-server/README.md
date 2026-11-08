@@ -7,3 +7,4 @@ High-performance Axum HTTP and Server-Sent Events (SSE) server daemon for **Rovi
 - Cryptographic receipt verification and claim-check outcome retrieval
 - Real-time Server-Sent Events (SSE) streaming for agent signals
 - Production-ready observability, health checks, and graceful shutdown
+

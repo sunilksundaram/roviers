@@ -7,3 +7,4 @@ Core protocol types, cryptographic credentials, and claim-check receipts for **R
 - Strongly-typed `Receipt` claim-check tokens
 - Asynchronous `ServiceOutcome` and `AgentSignal` definitions
 - Zero-copy serialization with Serde
+

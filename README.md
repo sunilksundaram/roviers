@@ -257,6 +257,7 @@ Explore the comprehensive operational guides:
   - **AI Agents & Multi-Agent Orchestrators** (Python async agent loop)
   - **RAG Ingestion Pipelines** (FastAPI / LlamaIndex background vector indexing)
   - **Standard Web Applications** (Node.js / TypeScript Express report generator)
+- 🗺️ **[Scale, Ops & Multi-Agent Architecture Roadmap (TODO)](docs/SCALE_AND_OPS_TODO.md)**: Production roadmap addressing multi-broker clustering, multi-tenant SSE scoping, interactive Human-In-The-Loop (HITL) session rendezvous, and LLM quota-aware rate limiting.
 
 ---
 

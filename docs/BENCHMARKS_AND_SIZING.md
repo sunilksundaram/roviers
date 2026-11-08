@@ -74,6 +74,23 @@ When clients present their Receipt Token and verified ID to retrieve the outcome
 
 ---
 
+## ⚠️ Broker Throughput vs. Downstream Agent Bottleneck Reality
+
+> [!IMPORTANT]
+> **Distinguishing Broker I/O from End-to-End Chassis Capacity:**
+> The 100k–160k req/s figures measured above represent **Broker Ingress & Claim-Check issuance**. In a real-world multi-agent chassis, overall completion throughput is constrained by downstream workers, not the Roviers broker:
+>
+> 1. **Upstream LLM Rate Limits (TPM / RPM):**
+>    Even if Roviers ingests 100,000 tasks/sec, a typical Azure OpenAI or Anthropic production quota might be 120,000 – 400,000 Tokens Per Minute (TPM). An agent workflow consuming 4,000 tokens per turn will hit an external rate limit ceiling at **~30 to 100 concurrent active turns per minute**.
+> 2. **Worker Sandbox & DB Capacity:**
+>    Worker execution nodes running Python runtimes, database transactions, or code-execution sandboxes (e.g., Cocoon) saturate at tens to hundreds of active concurrent tasks per worker host.
+> 3. **Interactive Human-In-The-Loop (HITL) Delays:**
+>    When tasks pause for clarification or user approval, turn latency extends from milliseconds to minutes/hours.
+>
+> Roviers acts as the shock absorber protecting your application servers from socket exhaustion during traffic spikes; see the **[Scale, Ops & Architecture Roadmap](SCALE_AND_OPS_TODO.md)** for quota-aware backpressure, worker leasing, and session rendezvous patterns.
+
+---
+
 ## 💻 Client-Side Sizing & Performance Impact
 
 The primary bottleneck in modern web apps and AI orchestrators is **holding open client connections** while downstream workers or LLM inference chains execute. Roviers fundamentally alters the client resource equation.
