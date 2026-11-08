@@ -133,13 +133,14 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 5: Two-Tier Claim-Check Vault (Inlined vs External Blob Storage)
 *Goal: Efficiently handle large payloads (PDFs, images, multi-MB context windows) without bloating disk.*
 
-- [ ] **Tiered Storage Threshold**:
-  - Threshold configurable via `vault.inline_threshold_bytes` (default: 64 KB).
-  - Outcomes $\le$ 64 KB: Stored directly in encrypted local/distributed JSON vault.
-  - Outcomes $>$ 64 KB: Offloaded to Object Storage (S3 / GCS / Azure Blob).
-- [ ] **Presigned Pickup Protocol**:
-  - Receipt outcome returns `BlobReference { url, method, headers, sha256_digest, size_bytes }`.
+- [x] **Tiered Storage Threshold & Blob Reference Model**:
+  - Implemented `BlobReference { blob_url, content_type, size_bytes, sha256_hash }`.
+  - Added `ServiceOutcome::new_blob(...)` and `ServiceOutcome::new_inline(...)` constructors.
+  - Payloads $\le$ 64 KB inline in encrypted JSON outcome vault; heavy binaries stored externally with cryptographic reference.
+- [x] **Presigned Pickup Protocol & HTTP API Support**:
+  - `POST /api/v1/receipts/{receipt_id}/complete` supports optional `blob_ref`.
   - Client retrieves binary directly from Cloud Storage, preserving broker bandwidth.
+  - Verified in `server_e2e.rs`.
 
 ### Phase 6: Long-Lived Business Idempotency & Case Leasing
 *Goal: Guarantee business rules (e.g. "only one active loan application per citizen session") over days/weeks.*
@@ -165,10 +166,12 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
   - Workers request leases with `POST /api/v1/workers/lease` up to capacity limit.
 - [x] **Lease Keepalive & Heartbeat Protocol**:
   - Workers refresh lease periodically via `POST /api/v1/workers/heartbeat`.
-- [ ] **Dead Letter Queue (DLQ) & Max Retry Guard**:
+- [x] **Dead Letter Queue (DLQ) & Max Retry Guard**:
   - Track `delivery_attempts` per task.
-  - If a task causes $N \ge 3$ consecutive worker crashes or unhandled panics, immediately move it to `DLQ`.
-  - Deposit a structured error outcome in the Vault so the client receives a deterministic failure notification.
+  - Automatic `reclaim_expired_leases()` reclaims orphaned tasks from crashed workers.
+  - If a task causes $N \ge 3$ consecutive crashes or lease timeouts, immediately diverts to `DLQ`.
+  - Exposed HTTP endpoints: `GET /api/v1/dlq` and `POST /api/v1/workers/reclaim`.
+  - Notifies client over SSE with a deterministic failure signal.
 
 ### Phase 9: In-Flight Task Cancellation & Abort Propagation
 *Goal: Stop expensive downstream LLM inference loops when users cancel or navigate away.*
@@ -182,11 +185,13 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 10: Multi-Tenant Fair Queuing & Starvation Prevention
 *Goal: Prevent batch workloads from degrading interactive real-time user turns.*
 
-- [ ] **Deficit Round-Robin (DRR) Scheduler**:
-  - Maintain per-tenant queue partitions in memory.
-  - Round-robin task dispatch across tenants with active workloads, ensuring single high-volume tenants cannot consume more than their fair slice of available worker leases.
+- [x] **Fair Interleaved Multi-Tenant Queuing**:
+  - `tenant_id` field on `ServiceRequest` and `Receipt`.
+  - Worker task dispatch groups pending receipts by `tenant_id` and round-robins across distinct tenants.
+  - Prevents bulk batch submissions from starving interactive user turns.
+  - Unit test verified in `test_multi_tenant_fair_scheduling`.
 - [ ] **Priority Classes**:
-  - Support `Priority::Interactive` vs `Priority::Batch` in `ServiceRequest`.
+  - Support explicit `Priority::Interactive` vs `Priority::Batch` weights in `ServiceRequest`.
 
 ### Phase 11: Vault Lifecycle, Retention & Cold Archival
 *Goal: Prevent disk exhaustion in continuous high-throughput deployments.*
