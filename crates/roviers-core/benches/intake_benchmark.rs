@@ -90,6 +90,7 @@ fn bench_vault_redemption(c: &mut Criterion) {
                 service_name: "bench.storage.fetch".into(),
                 completed_at: chrono::Utc::now().timestamp(),
                 result: serde_json::json!({ "computed_hash": "a8f3b299e120" }),
+                blob_ref: None,
             };
             engine.complete_service(outcome).unwrap();
         }

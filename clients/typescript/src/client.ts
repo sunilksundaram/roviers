@@ -3,6 +3,10 @@ import {
   RoviersReceipt,
   RoviersOutcome,
   AgentSignal,
+  BlobReference,
+  SignedResumeToken,
+  ServiceBackoff,
+  WorkerLeaseResponse,
 } from './types';
 
 export interface RoviersBrokerOptions {
@@ -143,13 +147,227 @@ export class RoviersBrokerClient {
   }
 
   /**
+   * Cancel an in-flight receipt.
+   */
+  async cancel(receiptId: string, reason?: string): Promise<RoviersReceipt> {
+    if (!this.token) {
+      throw new Error('A valid SignedAgentToken is required to cancel a task.');
+    }
+
+    const res = await fetch(`${this.baseUrl}/api/v1/receipts/${receiptId}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        receipt_id: receiptId,
+        agent_token: this.token,
+        reason: reason || null,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Cancel failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as RoviersReceipt;
+  }
+
+  /**
+   * Park an active task awaiting human or agent input (HITL).
+   */
+  async parkForInput(
+    receiptId: string,
+    question: string,
+    schemaForAnswer?: any,
+    checkpointUri?: string,
+    ttlSecs: number = 3600
+  ): Promise<SignedResumeToken> {
+    const res = await fetch(`${this.baseUrl}/api/v1/receipts/${receiptId}/park`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        receipt_id: receiptId,
+        question,
+        schema_for_answer: schemaForAnswer || null,
+        checkpoint_uri: checkpointUri || null,
+        ttl_secs: ttlSecs,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Park for input failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as SignedResumeToken;
+  }
+
+  /**
+   * Resume a parked HITL turn with user input and the signed resume token.
+   */
+  async resumeSession(
+    sessionId: string,
+    resumeToken: SignedResumeToken,
+    answer: any
+  ): Promise<RoviersReceipt> {
+    if (!this.token) {
+      throw new Error('A valid SignedAgentToken is required to resume a session.');
+    }
+
+    const res = await fetch(`${this.baseUrl}/api/v1/sessions/${sessionId}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resume_token: resumeToken,
+        answer,
+        agent_token: this.token,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Resume session failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as RoviersReceipt;
+  }
+
+  /**
+   * Apply dynamic backpressure / backoff to a downstream service.
+   */
+  async setBackoff(
+    serviceName: string,
+    durationSecs: number,
+    reason: string,
+    concurrencyCap?: number
+  ): Promise<ServiceBackoff> {
+    const res = await fetch(`${this.baseUrl}/api/v1/services/${serviceName}/backoff`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        duration_secs: durationSecs,
+        reason,
+        concurrency_cap: concurrencyCap || null,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Set backoff failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as ServiceBackoff;
+  }
+
+  /**
+   * Resume normal service intake after backoff recovery.
+   */
+  async unsetBackoff(serviceName: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/v1/services/${serviceName}/resume`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Unset backoff failed: ${res.status} ${await res.text()}`);
+    }
+  }
+
+  /**
+   * Acquire a capacity lease of tasks for a worker node.
+   */
+  async leaseTasks(
+    workerId: string,
+    serviceFilter?: string,
+    maxTasks: number = 10,
+    availableTpmBudget?: number,
+    activeInflight: number = 0
+  ): Promise<WorkerLeaseResponse> {
+    const res = await fetch(`${this.baseUrl}/api/v1/workers/lease`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        worker_id: workerId,
+        service_filter: serviceFilter || null,
+        max_tasks: maxTasks,
+        available_tpm_budget: availableTpmBudget || null,
+        active_inflight: activeInflight,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Worker lease failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as WorkerLeaseResponse;
+  }
+
+  /**
+   * Send heartbeat to keep an active worker lease alive.
+   */
+  async heartbeat(workerId: string, leaseId: string, extendSecs: number = 45): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/v1/workers/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        worker_id: workerId,
+        lease_id: leaseId,
+        extend_secs: extendSecs,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Heartbeat failed: ${res.status} ${await res.text()}`);
+    }
+  }
+
+  /**
+   * Reclaim orphaned tasks from expired worker leases.
+   */
+  async reclaimExpiredLeases(): Promise<string[]> {
+    const res = await fetch(`${this.baseUrl}/api/v1/workers/reclaim`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Reclaim leases failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as string[];
+  }
+
+  /**
+   * List tasks diverted to the Dead Letter Queue.
+   */
+  async listDlq(): Promise<RoviersReceipt[]> {
+    const res = await fetch(`${this.baseUrl}/api/v1/dlq`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`List DLQ failed: ${res.status} ${await res.text()}`);
+    }
+
+    return (await res.json()) as RoviersReceipt[];
+  }
+
+  /**
    * Worker method: deposit finished task outcome into the Broker Vault.
    */
-  async complete<T = any>(receiptId: string, result: T): Promise<void> {
+  async complete<T = any>(receiptId: string, result: T, blobRef?: BlobReference): Promise<void> {
+    const payload: any = { result };
+    if (blobRef) {
+      payload.blob_ref = blobRef;
+    }
+
     const res = await fetch(`${this.baseUrl}/api/v1/receipts/${receiptId}/complete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ result }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 

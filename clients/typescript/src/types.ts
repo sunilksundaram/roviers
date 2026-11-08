@@ -21,12 +21,49 @@ export interface RoviersReceipt {
   callback_url?: string;
 }
 
+export interface BlobReference {
+  blob_url: string;
+  content_type: string;
+  size_bytes: number;
+  sha256_hash: string;
+}
+
+export interface ResumePayload {
+  session_id: string;
+  receipt_id: string;
+  agent_id: string;
+  question: string;
+  schema_for_answer?: any;
+  checkpoint_uri?: string;
+  expires_at: number;
+}
+
+export interface SignedResumeToken {
+  payload: ResumePayload;
+  signature_bytes: number[];
+}
+
+export interface ServiceBackoff {
+  service_name: string;
+  backed_off_until: number;
+  reason: string;
+  concurrency_cap: number;
+}
+
+export interface WorkerLeaseResponse {
+  lease_id: string;
+  worker_id: string;
+  granted_tasks: any[];
+  lease_expires_at: number;
+}
+
 export interface RoviersOutcome<T = any> {
   receipt_id: string;
   agent_id: string;
   service_name: string;
   completed_at: number;
   result: T;
+  blob_ref?: BlobReference;
 }
 
 export interface AgentSignal {

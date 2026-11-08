@@ -8,7 +8,7 @@ use axum::{
 use futures::stream::Stream;
 use roviers_core::RoviersEngine;
 use roviers_proto::{
-    CancellationRequest, ParkForInputRequest, Receipt, ServiceBackoff, ServiceOutcome,
+    BlobReference, CancellationRequest, ParkForInputRequest, Receipt, ServiceBackoff, ServiceOutcome,
     ServiceRequest, SessionResumeRequest, SetBackoffRequest, SignedAgentToken, SignedResumeToken,
     WorkerHeartbeatRequest, WorkerLeaseRequest, WorkerLeaseResponse,
 };
@@ -51,6 +51,8 @@ pub struct PickupRequest {
 #[derive(Deserialize)]
 pub struct CompleteRequest {
     pub result: serde_json::Value,
+    #[serde(default)]
+    pub blob_ref: Option<BlobReference>,
 }
 
 pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
@@ -90,6 +92,9 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
         // Worker Capacity Leases & Heartbeats
         .route("/api/v1/workers/lease", post(lease_tasks))
         .route("/api/v1/workers/heartbeat", post(worker_heartbeat))
+        .route("/api/v1/workers/reclaim", post(reclaim_expired_leases))
+        // Dead Letter Queue
+        .route("/api/v1/dlq", get(list_dlq))
         // SSE Real-Time Completion Signals
         .route(
             "/api/v1/agents/{agent_id}/stream",
@@ -248,6 +253,7 @@ pub async fn complete_receipt(
         service_name: receipt.service_name,
         completed_at: chrono::Utc::now().timestamp(),
         result: req.result,
+        blob_ref: req.blob_ref,
     };
 
     state
@@ -348,6 +354,18 @@ pub async fn worker_heartbeat(
         })
 }
 
+/// Reclaim expired worker leases, re-queuing orphaned tasks or moving exceeded retries to DLQ
+pub async fn reclaim_expired_leases(State(state): State<AppState>) -> Json<Vec<Uuid>> {
+    let reclaimed = state.engine.reclaim_expired_leases();
+    Json(reclaimed)
+}
+
+/// List all dead-lettered / permanently failed receipts
+pub async fn list_dlq(State(state): State<AppState>) -> Json<Vec<Receipt>> {
+    let dlq = state.engine.list_dlq();
+    Json(dlq)
+}
+
 /// List all active receipts for an agent
 pub async fn list_agent_receipts(
     State(state): State<AppState>,
@@ -438,6 +456,7 @@ pub fn spawn_worker_pool(engine: Arc<RoviersEngine>) {
                                 "seal": "BROKER_VERIFIED",
                                 "details": req.payload
                             }),
+                            blob_ref: None,
                         };
 
                         if let Err(e) = engine.complete_service(outcome) {

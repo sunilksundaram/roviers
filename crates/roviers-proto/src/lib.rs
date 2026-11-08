@@ -110,6 +110,10 @@ pub struct ServiceRequest {
     pub callback_url: Option<String>,
     #[serde(default)]
     pub session_turn: Option<SessionTurn>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub priority: Option<u8>,
 }
 
 impl ServiceRequest {
@@ -126,7 +130,19 @@ impl ServiceRequest {
             payload,
             callback_url,
             session_turn: None,
+            tenant_id: None,
+            priority: None,
         }
+    }
+
+    pub fn with_tenant(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = Some(priority);
+        self
     }
 
     pub fn with_session(mut self, session_id: impl Into<String>, turn_id: u64, parent: Option<Uuid>) -> Self {
@@ -290,6 +306,10 @@ pub struct Receipt {
     pub estimated_ready_secs: Option<u64>,
     #[serde(default)]
     pub callback_url: Option<String>,
+    #[serde(default)]
+    pub delivery_attempts: u32,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl Receipt {
@@ -302,8 +322,19 @@ impl Receipt {
             status: ReceiptStatus::Queued,
             estimated_ready_secs,
             callback_url: req.callback_url.clone(),
+            delivery_attempts: 0,
+            tenant_id: req.tenant_id.clone(),
         }
     }
+}
+
+/// Cryptographic reference to an external object storage payload (S3 / GCS / Azure Blob)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlobReference {
+    pub blob_url: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    pub sha256_hash: String,
 }
 
 /// The final outcome / output of the service stored in the Broker Vault
@@ -314,6 +345,43 @@ pub struct ServiceOutcome {
     pub service_name: String,
     pub completed_at: i64,
     pub result: serde_json::Value,
+    #[serde(default)]
+    pub blob_ref: Option<BlobReference>,
+}
+
+impl ServiceOutcome {
+    pub fn new_inline(
+        receipt_id: Uuid,
+        agent_id: impl Into<String>,
+        service_name: impl Into<String>,
+        result: serde_json::Value,
+    ) -> Self {
+        Self {
+            receipt_id,
+            agent_id: agent_id.into(),
+            service_name: service_name.into(),
+            completed_at: Utc::now().timestamp(),
+            result,
+            blob_ref: None,
+        }
+    }
+
+    pub fn new_blob(
+        receipt_id: Uuid,
+        agent_id: impl Into<String>,
+        service_name: impl Into<String>,
+        summary_result: serde_json::Value,
+        blob_ref: BlobReference,
+    ) -> Self {
+        Self {
+            receipt_id,
+            agent_id: agent_id.into(),
+            service_name: service_name.into(),
+            completed_at: Utc::now().timestamp(),
+            result: summary_result,
+            blob_ref: Some(blob_ref),
+        }
+    }
 }
 
 /// Notification signal pushed to the agent when their outcome is ready

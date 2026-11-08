@@ -168,14 +168,176 @@ class RoviersBrokerClient:
             resp.raise_for_status()
             return RoviersOutcome.from_dict(resp.json())
 
-    async def complete(self, receipt_id: str, result: Any) -> None:
+    async def cancel(self, receipt_id: str, reason: Optional[str] = None) -> RoviersReceipt:
         """
-        Worker capability: deposits a finished execution outcome into the Vault.
+        Cancels an in-flight receipt.
+        """
+        if not self.token_data:
+            raise ValueError("Token required for task cancellation.")
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/receipts/{receipt_id}/cancel",
+                json={"receipt_id": receipt_id, "agent_token": self.token_data, "reason": reason},
+            )
+            resp.raise_for_status()
+            return RoviersReceipt.from_dict(resp.json())
+
+    async def park_for_input(
+        self,
+        receipt_id: str,
+        question: str,
+        schema_for_answer: Optional[Dict[str, Any]] = None,
+        checkpoint_uri: Optional[str] = None,
+        ttl_secs: Optional[int] = 3600,
+    ) -> Dict[str, Any]:
+        """
+        Parks an active task awaiting human or agent clarification (HITL).
+        Returns the SignedResumeToken.
         """
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
+                f"{self.base_url}/api/v1/receipts/{receipt_id}/park",
+                json={
+                    "receipt_id": receipt_id,
+                    "question": question,
+                    "schema_for_answer": schema_for_answer,
+                    "checkpoint_uri": checkpoint_uri,
+                    "ttl_secs": ttl_secs,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def resume_session(
+        self,
+        session_id: str,
+        resume_token: Dict[str, Any],
+        answer: Any,
+    ) -> RoviersReceipt:
+        """
+        Resumes a parked session with user input and the cryptographic resume token.
+        """
+        if not self.token_data:
+            raise ValueError("Token required for session resumption.")
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/sessions/{session_id}/resume",
+                json={
+                    "resume_token": resume_token,
+                    "answer": answer,
+                    "agent_token": self.token_data,
+                },
+            )
+            resp.raise_for_status()
+            return RoviersReceipt.from_dict(resp.json())
+
+    async def set_backoff(
+        self,
+        service_name: str,
+        duration_secs: int,
+        reason: str,
+        concurrency_cap: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Dynamically applies backpressure / backoff to a downstream service.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/services/{service_name}/backoff",
+                json={
+                    "duration_secs": duration_secs,
+                    "reason": reason,
+                    "concurrency_cap": concurrency_cap,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def unset_backoff(self, service_name: str) -> None:
+        """
+        Resumes normal service intake after backoff recovery.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(f"{self.base_url}/api/v1/services/{service_name}/resume")
+            resp.raise_for_status()
+
+    async def get_service_status(self, service_name: str) -> Dict[str, Any]:
+        """
+        Queries downstream circuit and backpressure status for a service.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{self.base_url}/api/v1/services/{service_name}/status")
+            resp.raise_for_status()
+            return resp.json()
+
+    async def lease_tasks(
+        self,
+        worker_id: str,
+        service_filter: Optional[str] = None,
+        max_tasks: int = 10,
+        available_tpm_budget: Optional[int] = None,
+        active_inflight: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Worker capacity lease to safely acquire task batches under rate/TPM limits.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/workers/lease",
+                json={
+                    "worker_id": worker_id,
+                    "service_filter": service_filter,
+                    "max_tasks": max_tasks,
+                    "available_tpm_budget": available_tpm_budget,
+                    "active_inflight": active_inflight,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def heartbeat(self, worker_id: str, lease_id: str, extend_secs: int = 45) -> None:
+        """
+        Extends active worker lease expiration.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/workers/heartbeat",
+                json={"worker_id": worker_id, "lease_id": lease_id, "extend_secs": extend_secs},
+            )
+            resp.raise_for_status()
+
+    async def reclaim_expired_leases(self) -> list:
+        """
+        Reclaims orphaned tasks from crashed workers or diverts them to DLQ.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(f"{self.base_url}/api/v1/workers/reclaim")
+            resp.raise_for_status()
+            return resp.json()
+
+    async def list_dlq(self) -> list:
+        """
+        Lists permanently failed tasks diverted to the Dead Letter Queue.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{self.base_url}/api/v1/dlq")
+            resp.raise_for_status()
+            return resp.json()
+
+    async def complete(self, receipt_id: str, result: Any, blob_ref: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Worker capability: deposits a finished execution outcome into the Vault.
+        """
+        payload: Dict[str, Any] = {"result": result}
+        if blob_ref:
+            payload["blob_ref"] = blob_ref
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
                 f"{self.base_url}/api/v1/receipts/{receipt_id}/complete",
-                json={"result": result},
+                json=payload,
             )
             resp.raise_for_status()
 

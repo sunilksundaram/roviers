@@ -69,6 +69,7 @@ pub struct RoviersEngine {
     outcomes: Arc<RwLock<HashMap<Uuid, ServiceOutcome>>>,
     pub service_backoffs: Arc<RwLock<HashMap<String, ServiceBackoff>>>,
     pub worker_leases: Arc<RwLock<HashMap<Uuid, ActiveWorkerLease>>>,
+    pub dlq: Arc<RwLock<Vec<Receipt>>>,
     signal_bus: broadcast::Sender<AgentSignal>,
     http_client: reqwest::Client,
 }
@@ -156,6 +157,7 @@ impl RoviersEngine {
             outcomes: Arc::new(RwLock::new(outcomes_map)),
             service_backoffs: Arc::new(RwLock::new(HashMap::new())),
             worker_leases: Arc::new(RwLock::new(HashMap::new())),
+            dlq: Arc::new(RwLock::new(Vec::new())),
             signal_bus,
             http_client,
         })
@@ -611,15 +613,16 @@ impl RoviersEngine {
     }
 
     /// Worker capacity lease allocation:
-    /// Workers request batches up to their current capacity slot ceiling,
-    /// preventing stampedes against slow or rate-limited downstream services.
+    /// Workers request batches up to their current capacity slot ceiling.
+    /// Implements Multi-Tenant Fair Scheduling (Deficit Round-Robin) across tenants
+    /// to prevent noisy neighbor starvation, while strictly respecting active service backoffs.
     pub fn lease_tasks(
         &self,
         req: WorkerLeaseRequest,
         lease_ttl_secs: i64,
     ) -> Result<WorkerLeaseResponse, CoreError> {
         let receipts = self.receipts.read().unwrap();
-        let mut eligible_ids = Vec::new();
+        let mut tenant_queues: HashMap<String, Vec<Uuid>> = HashMap::new();
 
         for (id, r) in receipts.iter() {
             if r.status == ReceiptStatus::Queued {
@@ -630,13 +633,27 @@ impl RoviersEngine {
                 if self.get_service_backoff(&r.service_name).is_some_and(|b| b.backed_off_until > Utc::now().timestamp()) {
                     continue;
                 }
-                eligible_ids.push(*id);
-                if eligible_ids.len() >= req.max_tasks {
-                    break;
-                }
+                let tenant = r.tenant_id.clone().unwrap_or_else(|| "default".into());
+                tenant_queues.entry(tenant).or_default().push(*id);
             }
         }
         drop(receipts);
+
+        // Fair interleave across tenant queues
+        let mut eligible_ids = Vec::new();
+        let mut active = true;
+        while active && eligible_ids.len() < req.max_tasks {
+            active = false;
+            for queue in tenant_queues.values_mut() {
+                if let Some(id) = queue.pop() {
+                    eligible_ids.push(id);
+                    active = true;
+                    if eligible_ids.len() >= req.max_tasks {
+                        break;
+                    }
+                }
+            }
+        }
 
         // Transition leased tasks to Processing
         let mut receipts = self.receipts.write().unwrap();
@@ -686,6 +703,81 @@ impl RoviersEngine {
         } else {
             Err(CoreError::ReceiptNotFound(lease_id))
         }
+    }
+
+    /// Reclaims tasks from expired worker leases.
+    /// If a task has failed/crashed 3 or more times (poison pill or persistent worker crash),
+    /// it is diverted to the Dead Letter Queue (DLQ) with a permanent failure notice.
+    pub fn reclaim_expired_leases(&self) -> Vec<Uuid> {
+        let now = Utc::now().timestamp();
+        let mut expired_leases = Vec::new();
+
+        {
+            let mut leases = self.worker_leases.write().unwrap();
+            let expired_keys: Vec<Uuid> = leases
+                .iter()
+                .filter(|(_, l)| l.expires_at <= now)
+                .map(|(k, _)| *k)
+                .collect();
+
+            for k in expired_keys {
+                if let Some(l) = leases.remove(&k) {
+                    expired_leases.push(l);
+                }
+            }
+        }
+
+        let mut reclaimed_tasks = Vec::new();
+        let mut receipts = self.receipts.write().unwrap();
+        let mut dlq = self.dlq.write().unwrap();
+
+        for lease in expired_leases {
+            for task_id in lease.task_ids {
+                let Some(receipt) = receipts.get_mut(&task_id) else {
+                    continue;
+                };
+                if receipt.status != ReceiptStatus::Processing {
+                    continue;
+                }
+
+                receipt.delivery_attempts += 1;
+                if receipt.delivery_attempts >= 3 {
+                    let fail_msg = format!(
+                        "Exceeded max delivery attempts ({}). Diverted to Dead Letter Queue (DLQ).",
+                        receipt.delivery_attempts
+                    );
+                    receipt.status = ReceiptStatus::Failed(fail_msg.clone());
+                    dlq.push(receipt.clone());
+
+                    let signal = AgentSignal {
+                        signal_id: Uuid::now_v7(),
+                        receipt_id: task_id,
+                        agent_id: receipt.agent_id.clone(),
+                        service_name: receipt.service_name.clone(),
+                        status: receipt.status.clone(),
+                        message: fail_msg,
+                        pickup_url: format!("/api/v1/receipts/{}", task_id),
+                        timestamp: now,
+                    };
+                    let _ = self.signal_bus.send(signal);
+                } else {
+                    receipt.status = ReceiptStatus::Queued;
+                    reclaimed_tasks.push(task_id);
+                }
+
+                let receipt_path = self.vault_dir.join(format!("{}.receipt.json", task_id));
+                if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+                    let _ = std::fs::write(receipt_path, data);
+                }
+            }
+        }
+
+        reclaimed_tasks
+    }
+
+    /// List all tasks in the Dead Letter Queue
+    pub fn list_dlq(&self) -> Vec<Receipt> {
+        self.dlq.read().unwrap().clone()
     }
 
     /// Get current status of a receipt
@@ -783,6 +875,7 @@ mod tests {
             service_name: "treasury.mint_bond".into(),
             completed_at: Utc::now().timestamp(),
             result: serde_json::json!({ "bond_id": "BOND-9999", "status": "ISSUED" }),
+            blob_ref: None,
         };
 
         engine
@@ -849,6 +942,7 @@ mod tests {
                 service_name: "computation.analytic_engine".into(),
                 completed_at: Utc::now().timestamp(),
                 result: serde_json::json!({ "status": "COMPUTED", "result_val": 42 }),
+                blob_ref: None,
             };
             engine
                 .complete_service(outcome)
@@ -947,6 +1041,7 @@ mod tests {
             service_name: "quote.generate".into(),
             completed_at: Utc::now().timestamp(),
             result: serde_json::json!({ "total": 120.50, "tax": 10.50 }),
+            blob_ref: None,
         };
         engine.complete_service(outcome).expect("Completion failed");
 
@@ -986,7 +1081,6 @@ mod tests {
         let req2 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 2 }), None);
         let receipt2 = engine.submit_service_request(req2).await.expect("Submit 2 during backoff should succeed");
         assert_eq!(receipt2.status, ReceiptStatus::Queued);
-        // Estimated ready secs should reflect remaining backoff (~60s + base 5s = ~65s)
         assert!(receipt2.estimated_ready_secs.unwrap() >= 60);
 
         // 4. Verify backoff lookup
@@ -1056,6 +1150,120 @@ mod tests {
         // Verify heartbeat extension
         let hb_res = engine.worker_heartbeat(lease_resp.lease_id, 60);
         assert!(hb_res.is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_two_tier_vault_and_dlq_reclaim() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_dlq_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let agent_token = engine
+            .issue_agent_token("AGENT-ENTERPRISE-01", "Enterprise Agent", 86400)
+            .expect("Failed to issue token");
+
+        // 1. Two-Tier Vault: Large payload stored as BlobReference
+        let blob_ref = roviers_proto::BlobReference {
+            blob_url: "s3://roviers-vault-blobs/outcomes/heavy_quote_1001.pdf".into(),
+            content_type: "application/pdf".into(),
+            size_bytes: 4_500_000,
+            sha256_hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        };
+
+        let req = ServiceRequest::new("quote.pdf", agent_token.clone(), serde_json::json!({ "quote_id": 1001 }), None);
+        let req_id = req.request_id;
+        let _ = engine.submit_service_request(req).await.unwrap();
+
+        let blob_outcome = ServiceOutcome::new_blob(
+            req_id,
+            "AGENT-ENTERPRISE-01",
+            "quote.pdf",
+            serde_json::json!({ "summary": "4.5MB PDF quote generated" }),
+            blob_ref.clone(),
+        );
+
+        engine.complete_service(blob_outcome).expect("Complete blob service failed");
+
+        let picked_up = engine.pickup_outcome(req_id, &agent_token).expect("Pickup failed");
+        assert!(picked_up.blob_ref.is_some());
+        assert_eq!(picked_up.blob_ref.unwrap().size_bytes, 4_500_000);
+
+        // 2. Dead Letter Queue & Expired Lease Reclaim
+        // Submit a poison pill task
+        let poison_req = ServiceRequest::new("flaky.task", agent_token.clone(), serde_json::json!({ "flaky": true }), None);
+        let poison_id = poison_req.request_id;
+        let _ = engine.submit_service_request(poison_req).await.unwrap();
+
+        // Lease with 0-second TTL (immediately expired)
+        let lease_req = WorkerLeaseRequest {
+            worker_id: "CRASHING-WORKER-01".into(),
+            service_filter: Some("flaky.task".into()),
+            max_tasks: 1,
+            available_tpm_budget: None,
+            active_inflight: 0,
+        };
+        let _ = engine.lease_tasks(lease_req.clone(), -1).expect("Lease failed");
+
+        // Reclaim attempt 1: task is re-queued
+        let reclaimed_1 = engine.reclaim_expired_leases();
+        assert_eq!(reclaimed_1, vec![poison_id]);
+        assert_eq!(engine.get_receipt(poison_id).unwrap().status, ReceiptStatus::Queued);
+
+        // Re-lease and crash attempt 2
+        let _ = engine.lease_tasks(lease_req.clone(), -1).expect("Lease 2 failed");
+        let reclaimed_2 = engine.reclaim_expired_leases();
+        assert_eq!(reclaimed_2, vec![poison_id]);
+
+        // Re-lease and crash attempt 3: max retries exceeded -> Diverts to DLQ!
+        let _ = engine.lease_tasks(lease_req, -1).expect("Lease 3 failed");
+        let reclaimed_3 = engine.reclaim_expired_leases();
+        assert!(reclaimed_3.is_empty()); // Not re-queued; moved to DLQ
+
+        let dlq_tasks = engine.list_dlq();
+        assert_eq!(dlq_tasks.len(), 1);
+        assert_eq!(dlq_tasks[0].receipt_id, poison_id);
+        assert!(matches!(dlq_tasks[0].status, ReceiptStatus::Failed(_)));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_multi_tenant_fair_scheduling() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_fair_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let token_a = engine.issue_agent_token("AGENT-A", "Tenant A Agent", 86400).unwrap();
+        let token_b = engine.issue_agent_token("AGENT-B", "Tenant B Agent", 86400).unwrap();
+
+        // Tenant A submits 3 batch jobs
+        for i in 0..3 {
+            let req = ServiceRequest::new("analytics.crunch", token_a.clone(), serde_json::json!({ "job": i }), None)
+                .with_tenant("tenant-A");
+            let _ = engine.submit_service_request(req).await.unwrap();
+        }
+
+        // Tenant B submits 1 urgent interactive job
+        let req_b = ServiceRequest::new("analytics.crunch", token_b.clone(), serde_json::json!({ "urgent": true }), None)
+            .with_tenant("tenant-B");
+        let b_id = req_b.request_id;
+        let _ = engine.submit_service_request(req_b).await.unwrap();
+
+        // Worker requests a batch of 2 tasks
+        let lease_req = WorkerLeaseRequest {
+            worker_id: "WORKER-FAIR-01".into(),
+            service_filter: Some("analytics.crunch".into()),
+            max_tasks: 2,
+            available_tpm_budget: None,
+            active_inflight: 0,
+        };
+
+        let lease = engine.lease_tasks(lease_req, 60).unwrap();
+        let active_lease = engine.worker_leases.read().unwrap().get(&lease.lease_id).unwrap().clone();
+
+        // Fair scheduling guarantees Tenant B is included in the very first batch of 2,
+        // avoiding starvation behind Tenant A's batch!
+        assert!(active_lease.task_ids.contains(&b_id));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

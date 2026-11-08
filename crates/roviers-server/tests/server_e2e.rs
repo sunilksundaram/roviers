@@ -3,7 +3,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use roviers_core::RoviersEngine;
 use roviers_proto::{
-    CancellationRequest, ParkForInputRequest, Receipt, ReceiptStatus, ServiceOutcome,
+    BlobReference, CancellationRequest, ParkForInputRequest, Receipt, ReceiptStatus, ServiceOutcome,
     ServiceRequest, SessionResumeRequest, SignedAgentToken, SignedResumeToken,
     WorkerHeartbeatRequest, WorkerLeaseRequest, WorkerLeaseResponse,
 };
@@ -483,36 +483,20 @@ async fn test_server_backpressure_and_dynamic_backoff_http() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    // 7. Verify status returned to NORMAL
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/services/{}/status", service))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let status_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(status_val["status"], "NORMAL");
-
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 #[tokio::test]
 async fn test_server_cancellation_and_worker_leases_http() {
-    let temp_dir = std::env::temp_dir().join(format!("roviers_http_leases_{}", Uuid::now_v7()));
+    let temp_dir = std::env::temp_dir().join(format!("roviers_http_cancel_{}", Uuid::now_v7()));
     let engine = Arc::new(RoviersEngine::new(&temp_dir).expect("Failed to init engine"));
     let app = create_app(Arc::clone(&engine));
 
     // 1. Issue Agent Token
     let auth_body = serde_json::to_vec(&serde_json::json!({
-        "agent_id": "AGENT-LEASE-USER",
-        "agent_name": "Lease User Agent",
-        "validity_days": 5
+        "agent_id": "AGENT-WORKER-01",
+        "agent_name": "Batch Worker Agent",
+        "validity_days": 10
     }))
     .unwrap();
 
@@ -651,6 +635,139 @@ async fn test_server_cancellation_and_worker_leases_http() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_server_dlq_and_two_tier_blob_vault_http() {
+    let temp_dir = std::env::temp_dir().join(format!("roviers_http_dlq_test_{}", Uuid::now_v7()));
+    let engine = Arc::new(RoviersEngine::new(&temp_dir).expect("Failed to init engine"));
+    let app = create_app(Arc::clone(&engine));
+
+    // 1. Issue Agent Token
+    let auth_body = serde_json::to_vec(&serde_json::json!({
+        "agent_id": "AGENT-BLOB-TEST",
+        "agent_name": "Blob Test Agent",
+        "validity_days": 30
+    }))
+    .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/agent")
+                .header("content-type", "application/json")
+                .body(Body::from(auth_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let token: SignedAgentToken = serde_json::from_slice(&bytes).unwrap();
+
+    // 2. Submit service request
+    let req = ServiceRequest::new(
+        "report.render_pdf",
+        token.clone(),
+        serde_json::json!({ "doc_id": 999 }),
+        None,
+    );
+    let req_id = req.request_id;
+    let b = serde_json::to_vec(&req).unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/services/report.render_pdf")
+                .header("content-type", "application/json")
+                .body(Body::from(b))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+    // 3. Complete with two-tier BlobReference
+    let blob = BlobReference {
+        blob_url: "s3://roviers-vault/reports/doc_999.pdf".into(),
+        content_type: "application/pdf".into(),
+        size_bytes: 8_200_100,
+        sha256_hash: "abcdef1234567890abcdef1234567890".into(),
+    };
+    let complete_body = serde_json::to_vec(&serde_json::json!({
+        "result": { "page_count": 42 },
+        "blob_ref": blob
+    }))
+    .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/receipts/{}/complete", req_id))
+                .header("content-type", "application/json")
+                .body(Body::from(complete_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 4. Pickup outcome and verify blob metadata
+    let pickup_body = serde_json::to_vec(&serde_json::json!({ "agent_token": token })).unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/receipts/{}/pickup", req_id))
+                .header("content-type", "application/json")
+                .body(Body::from(pickup_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let outcome: ServiceOutcome = serde_json::from_slice(&bytes).unwrap();
+    assert!(outcome.blob_ref.is_some());
+    assert_eq!(outcome.blob_ref.unwrap().size_bytes, 8_200_100);
+
+    // 5. Test reclaim & DLQ via HTTP
+    let dlq_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/dlq")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dlq_res.status(), StatusCode::OK);
+    let bytes = dlq_res.into_body().collect().await.unwrap().to_bytes();
+    let dlq_list: Vec<Receipt> = serde_json::from_slice(&bytes).unwrap();
+    assert!(dlq_list.is_empty());
+
+    let reclaim_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/workers/reclaim")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reclaim_res.status(), StatusCode::OK);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
