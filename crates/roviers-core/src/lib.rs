@@ -3,9 +3,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use roviers_ledger::{DedupLog, Ledger, LedgerError, TopicTrie};
 use roviers_proto::{
-    AgentCredentials, AgentSignal, ProtoError, Receipt, ReceiptStatus, ResumePayload,
-    ServiceBackoff, ServiceOutcome, ServiceRequest, SessionResumeRequest, SignedAgentToken,
-    SignedResumeToken, WorkerLeaseRequest, WorkerLeaseResponse,
+    AgentCredentials, AgentSignal, ClusterNodeInfo, ClusterTopologyResponse, PeerHeartbeatRequest,
+    ProtoError, Receipt, ReceiptStatus, ResumePayload, ServiceBackoff, ServiceOutcome,
+    ServiceRequest, SessionResumeRequest, SignedAgentToken, SignedResumeToken,
+    WorkerLeaseRequest, WorkerLeaseResponse,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,10 @@ pub enum CoreError {
     OutcomeNotReady(Uuid),
     #[error("Receipt {0} is not parked awaiting input")]
     NotParked(Uuid),
+    #[error("Business case locked for key '{0}' (active receipt {1})")]
+    BusinessCaseLocked(String, Uuid),
+    #[error("Forbidden: Agent missing required scope '{0}'")]
+    ScopeForbidden(String),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("IO error: {0}")]
@@ -70,6 +75,11 @@ pub struct RoviersEngine {
     pub service_backoffs: Arc<RwLock<HashMap<String, ServiceBackoff>>>,
     pub worker_leases: Arc<RwLock<HashMap<Uuid, ActiveWorkerLease>>>,
     pub dlq: Arc<RwLock<Vec<Receipt>>>,
+    pub business_case_locks: Arc<RwLock<HashMap<String, Uuid>>>,
+    pub cluster_nodes: Arc<RwLock<HashMap<String, ClusterNodeInfo>>>,
+    pub node_id: String,
+    pub is_leader: bool,
+    pub num_partitions: u32,
     signal_bus: broadcast::Sender<AgentSignal>,
     http_client: reqwest::Client,
 }
@@ -137,6 +147,42 @@ impl RoviersEngine {
             }
         }
 
+        // Initialize active business case locks from persisted receipts (Phase 6)
+        let mut business_case_locks = HashMap::new();
+        for (id, r) in &receipts_map {
+            if let Some(ref bkey) = r.business_key
+                && matches!(
+                    r.status,
+                    ReceiptStatus::Queued
+                        | ReceiptStatus::Processing
+                        | ReceiptStatus::ParkedAwaitingInput { .. }
+                )
+            {
+                business_case_locks.insert(bkey.clone(), *id);
+            }
+        }
+
+        // Initialize multi-broker node cluster state (Phase 3)
+        let node_id = format!(
+            "broker-node-{}",
+            broker_verifying_key.to_bytes()[..4]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+        let num_partitions = 16;
+        let mut cluster_nodes_map = HashMap::new();
+        cluster_nodes_map.insert(
+            node_id.clone(),
+            ClusterNodeInfo {
+                node_id: node_id.clone(),
+                listen_addr: "127.0.0.1:8080".into(),
+                is_leader: true,
+                assigned_partitions: (0..num_partitions).collect(),
+                last_heartbeat: Utc::now().timestamp(),
+            },
+        );
+
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -158,6 +204,11 @@ impl RoviersEngine {
             service_backoffs: Arc::new(RwLock::new(HashMap::new())),
             worker_leases: Arc::new(RwLock::new(HashMap::new())),
             dlq: Arc::new(RwLock::new(Vec::new())),
+            business_case_locks: Arc::new(RwLock::new(business_case_locks)),
+            cluster_nodes: Arc::new(RwLock::new(cluster_nodes_map)),
+            node_id,
+            is_leader: true,
+            num_partitions,
             signal_bus,
             http_client,
         })
@@ -171,6 +222,22 @@ impl RoviersEngine {
         validity_secs: i64,
     ) -> Result<SignedAgentToken, CoreError> {
         let creds = AgentCredentials::new(agent_id, agent_name, validity_secs);
+        let token = SignedAgentToken::issue(creds, &self.broker_signing_key)?;
+        Ok(token)
+    }
+
+    /// Issue a scoped identity token with fine-grained RBAC scopes and tenant isolation
+    pub fn issue_scoped_agent_token(
+        &self,
+        agent_id: &str,
+        agent_name: &str,
+        validity_secs: i64,
+        scopes: Vec<String>,
+        tenant_id: Option<String>,
+    ) -> Result<SignedAgentToken, CoreError> {
+        let mut creds = AgentCredentials::new(agent_id, agent_name, validity_secs);
+        creds.scopes = scopes;
+        creds.tenant_id = tenant_id;
         let token = SignedAgentToken::issue(creds, &self.broker_signing_key)?;
         Ok(token)
     }
@@ -214,6 +281,25 @@ impl RoviersEngine {
             return Err(CoreError::DuplicateRequest(req_id_str));
         }
 
+        // Step 2.1: Long-Lived Business Idempotency & Case Leasing (Phase 6)
+        if let Some(ref bkey) = request.business_key {
+            let mut locks = self.business_case_locks.write().unwrap();
+            if let Some(&existing_id) = locks.get(bkey) {
+                let receipts = self.receipts.read().unwrap();
+                if let Some(existing_receipt) = receipts.get(&existing_id)
+                    && matches!(
+                        existing_receipt.status,
+                        ReceiptStatus::Queued
+                            | ReceiptStatus::Processing
+                            | ReceiptStatus::ParkedAwaitingInput { .. }
+                    )
+                {
+                    return Err(CoreError::BusinessCaseLocked(bkey.clone(), existing_id));
+                }
+            }
+            locks.insert(bkey.clone(), request.request_id);
+        }
+
         // Step 3: Serialize and append transaction to Ledger
         let payload_bytes = serde_json::to_vec(&request)?;
         let topic = format!("service.{}", request.service_name);
@@ -235,7 +321,9 @@ impl RoviersEngine {
             Some(5)
         };
 
-        let receipt = Receipt::from_request(&request, estimated_ready_secs);
+        let partition_id = self.calculate_partition(&request);
+        let mut receipt = Receipt::from_request(&request, estimated_ready_secs);
+        receipt.partition_id = Some(partition_id);
 
         {
             let mut r = self.receipts.write().unwrap();
@@ -285,7 +373,7 @@ impl RoviersEngine {
             let _ = std::fs::write(outcome_path, data);
         }
 
-        let callback_url = {
+        let (callback_url, tenant_id, session_id, business_key, traceparent, tracestate, partition_id) = {
             let mut receipts = self.receipts.write().unwrap();
             if let Some(r) = receipts.get_mut(&receipt_id) {
                 r.status = ReceiptStatus::ReadyForPickup;
@@ -293,11 +381,25 @@ impl RoviersEngine {
                 if let Ok(data) = serde_json::to_string_pretty(r) {
                     let _ = std::fs::write(receipt_path, data);
                 }
-                r.callback_url.clone()
+                (
+                    r.callback_url.clone(),
+                    r.tenant_id.clone(),
+                    r.session_id.clone(),
+                    r.business_key.clone(),
+                    r.traceparent.clone(),
+                    r.tracestate.clone(),
+                    r.partition_id,
+                )
             } else {
-                None
+                (None, None, None, None, None, None, None)
             }
         };
+
+        // Release business case lock upon completion (Phase 6)
+        if let Some(ref bkey) = business_key {
+            let mut locks = self.business_case_locks.write().unwrap();
+            locks.remove(bkey);
+        }
 
         // Emit AgentSignal over the notification bus (SSE)
         let signal = AgentSignal {
@@ -312,6 +414,12 @@ impl RoviersEngine {
             ),
             pickup_url: format!("/api/v1/receipts/{}/pickup", receipt_id),
             timestamp: Utc::now().timestamp(),
+            tenant_id,
+            session_id,
+            business_key,
+            traceparent,
+            tracestate,
+            partition_id,
         };
 
         let _ = self.signal_bus.send(signal.clone());
@@ -428,6 +536,12 @@ impl RoviersEngine {
             message: format!("Interactive input required: {}", question),
             pickup_url: format!("/api/v1/sessions/{}/resume", session_id),
             timestamp: Utc::now().timestamp(),
+            tenant_id: receipt.tenant_id.clone(),
+            session_id: Some(session_id.clone()),
+            business_key: receipt.business_key.clone(),
+            traceparent: receipt.traceparent.clone(),
+            tracestate: receipt.tracestate.clone(),
+            partition_id: receipt.partition_id,
         };
 
         let _ = self.signal_bus.send(signal);
@@ -492,6 +606,12 @@ impl RoviersEngine {
             ),
             pickup_url: format!("/api/v1/receipts/{}/pickup", receipt_id),
             timestamp: Utc::now().timestamp(),
+            tenant_id: receipt.tenant_id.clone(),
+            session_id: Some(resume_payload.session_id.clone()),
+            business_key: receipt.business_key.clone(),
+            traceparent: receipt.traceparent.clone(),
+            tracestate: receipt.tracestate.clone(),
+            partition_id: receipt.partition_id,
         };
 
         let _ = self.signal_bus.send(signal);
@@ -534,6 +654,12 @@ impl RoviersEngine {
             let _ = std::fs::write(receipt_path, data);
         }
 
+        // Release business case lock upon cancellation (Phase 6)
+        if let Some(ref bkey) = receipt.business_key {
+            let mut locks = self.business_case_locks.write().unwrap();
+            locks.remove(bkey);
+        }
+
         let signal = AgentSignal {
             signal_id: Uuid::now_v7(),
             receipt_id,
@@ -543,6 +669,12 @@ impl RoviersEngine {
             message: format!("Task cancelled: {}", cancel_reason),
             pickup_url: format!("/api/v1/receipts/{}", receipt_id),
             timestamp: Utc::now().timestamp(),
+            tenant_id: receipt.tenant_id.clone(),
+            session_id: receipt.session_id.clone(),
+            business_key: receipt.business_key.clone(),
+            traceparent: receipt.traceparent.clone(),
+            tracestate: receipt.tracestate.clone(),
+            partition_id: receipt.partition_id,
         };
 
         let _ = self.signal_bus.send(signal);
@@ -733,41 +865,49 @@ impl RoviersEngine {
 
         for lease in expired_leases {
             for task_id in lease.task_ids {
-                let Some(receipt) = receipts.get_mut(&task_id) else {
-                    continue;
-                };
-                if receipt.status != ReceiptStatus::Processing {
-                    continue;
-                }
+                if let Some(receipt) = receipts.get_mut(&task_id)
+                    && receipt.status == ReceiptStatus::Processing
+                {
+                    receipt.delivery_attempts += 1;
+                    if receipt.delivery_attempts >= 3 {
+                        let fail_msg = format!(
+                            "Exceeded max delivery attempts ({}). Diverted to Dead Letter Queue (DLQ).",
+                            receipt.delivery_attempts
+                        );
+                        receipt.status = ReceiptStatus::Failed(fail_msg.clone());
+                        dlq.push(receipt.clone());
 
-                receipt.delivery_attempts += 1;
-                if receipt.delivery_attempts >= 3 {
-                    let fail_msg = format!(
-                        "Exceeded max delivery attempts ({}). Diverted to Dead Letter Queue (DLQ).",
-                        receipt.delivery_attempts
-                    );
-                    receipt.status = ReceiptStatus::Failed(fail_msg.clone());
-                    dlq.push(receipt.clone());
+                        if let Some(ref bkey) = receipt.business_key {
+                            let mut locks = self.business_case_locks.write().unwrap();
+                            locks.remove(bkey);
+                        }
 
-                    let signal = AgentSignal {
-                        signal_id: Uuid::now_v7(),
-                        receipt_id: task_id,
-                        agent_id: receipt.agent_id.clone(),
-                        service_name: receipt.service_name.clone(),
-                        status: receipt.status.clone(),
-                        message: fail_msg,
-                        pickup_url: format!("/api/v1/receipts/{}", task_id),
-                        timestamp: now,
-                    };
-                    let _ = self.signal_bus.send(signal);
-                } else {
-                    receipt.status = ReceiptStatus::Queued;
-                    reclaimed_tasks.push(task_id);
-                }
+                        let signal = AgentSignal {
+                            signal_id: Uuid::now_v7(),
+                            receipt_id: task_id,
+                            agent_id: receipt.agent_id.clone(),
+                            service_name: receipt.service_name.clone(),
+                            status: receipt.status.clone(),
+                            message: fail_msg,
+                            pickup_url: format!("/api/v1/receipts/{}", task_id),
+                            timestamp: now,
+                            tenant_id: receipt.tenant_id.clone(),
+                            session_id: receipt.session_id.clone(),
+                            business_key: receipt.business_key.clone(),
+                            traceparent: receipt.traceparent.clone(),
+                            tracestate: receipt.tracestate.clone(),
+                            partition_id: receipt.partition_id,
+                        };
+                        let _ = self.signal_bus.send(signal);
+                    } else {
+                        receipt.status = ReceiptStatus::Queued;
+                        reclaimed_tasks.push(task_id);
+                    }
 
-                let receipt_path = self.vault_dir.join(format!("{}.receipt.json", task_id));
-                if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
-                    let _ = std::fs::write(receipt_path, data);
+                    let receipt_path = self.vault_dir.join(format!("{}.receipt.json", task_id));
+                    if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+                        let _ = std::fs::write(receipt_path, data);
+                    }
                 }
             }
         }
@@ -817,6 +957,81 @@ impl RoviersEngine {
 
     pub fn subscribe_intimations(&self) -> broadcast::Receiver<AgentSignal> {
         self.subscribe_signals()
+    }
+
+    // --- Phase 3: Multi-Broker Partition Clustering ---
+
+    /// Calculate virtual partition for a request
+    pub fn calculate_partition(&self, req: &ServiceRequest) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(ref tid) = req.tenant_id {
+            tid.hash(&mut hasher);
+        } else if let Some(ref turn) = req.session_turn {
+            turn.session_id.hash(&mut hasher);
+        } else if let Some(ref bkey) = req.business_key {
+            bkey.hash(&mut hasher);
+        } else {
+            req.agent_token.credentials.agent_id.hash(&mut hasher);
+        }
+        (hasher.finish() % (self.num_partitions as u64)) as u32
+    }
+
+    /// Register or heartbeat a peer broker node in the cluster
+    pub fn register_or_heartbeat_peer(&self, peer: PeerHeartbeatRequest) -> ClusterNodeInfo {
+        let now = Utc::now().timestamp();
+        let info = ClusterNodeInfo {
+            node_id: peer.node_id.clone(),
+            listen_addr: peer.listen_addr,
+            is_leader: peer.is_leader,
+            assigned_partitions: peer.assigned_partitions,
+            last_heartbeat: now,
+        };
+        let mut nodes = self.cluster_nodes.write().unwrap();
+        nodes.insert(peer.node_id, info.clone());
+        info
+    }
+
+    /// Retrieve full cluster topology
+    pub fn get_cluster_topology(&self) -> ClusterTopologyResponse {
+        let nodes = self.cluster_nodes.read().unwrap();
+        let list: Vec<ClusterNodeInfo> = nodes.values().cloned().collect();
+        let leader_id = list.iter().find(|n| n.is_leader).map(|n| n.node_id.clone());
+
+        ClusterTopologyResponse {
+            cluster_id: "roviers-primary-cluster".into(),
+            leader_node_id: leader_id.or_else(|| if self.is_leader { Some(self.node_id.clone()) } else { None }),
+            total_partitions: self.num_partitions,
+            nodes: list,
+        }
+    }
+
+    // --- Phase 4: Multi-Tenant Scoped Security ---
+
+    /// Verify agent token has required scope (supports wildcard "service:all" or specific scope)
+    pub fn verify_scope(&self, token: &SignedAgentToken, required_scope: &str) -> Result<(), CoreError> {
+        let creds = token.verify(&self.broker_verifying_key)?;
+        if creds.scopes.iter().any(|s| s == "service:all" || s == "*" || s == required_scope) {
+            Ok(())
+        } else {
+            Err(CoreError::ScopeForbidden(required_scope.to_string()))
+        }
+    }
+
+    // --- Phase 6: Long-Lived Business Idempotency & Case Leasing ---
+
+    /// Inspect the active receipt holding a business case lock
+    pub fn get_business_case(&self, business_key: &str) -> Option<Receipt> {
+        let locks = self.business_case_locks.read().unwrap();
+        let receipt_id = locks.get(business_key)?;
+        let receipts = self.receipts.read().unwrap();
+        receipts.get(receipt_id).cloned()
+    }
+
+    /// Explicitly release a business case lock
+    pub fn release_business_case(&self, business_key: &str) -> bool {
+        let mut locks = self.business_case_locks.write().unwrap();
+        locks.remove(business_key).is_some()
     }
 }
 
@@ -1245,7 +1460,7 @@ mod tests {
 
         // Tenant B submits 1 urgent interactive job
         let req_b = ServiceRequest::new("analytics.crunch", token_b.clone(), serde_json::json!({ "urgent": true }), None)
-            .with_tenant("tenant-B");
+                .with_tenant("tenant-B");
         let b_id = req_b.request_id;
         let _ = engine.submit_service_request(req_b).await.unwrap();
 
@@ -1264,6 +1479,124 @@ mod tests {
         // Fair scheduling guarantees Tenant B is included in the very first batch of 2,
         // avoiding starvation behind Tenant A's batch!
         assert!(active_lease.task_ids.contains(&b_id));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_business_case_idempotency_locking() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_case_lock_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let token = engine.issue_agent_token("AGENT-CASE-01", "Case Worker", 86400).unwrap();
+
+        let business_key = "claim:CLM-2026-9999";
+
+        // 1. Submit initial request with business_key
+        let req1 = ServiceRequest::new("claims.process", token.clone(), serde_json::json!({ "amount": 500 }), None)
+            .with_business_key(business_key);
+        let req1_id = req1.request_id;
+
+        let receipt1 = engine.submit_service_request(req1).await.expect("Submit 1 failed");
+        assert_eq!(receipt1.business_key, Some(business_key.to_string()));
+
+        // Verify case lock is held
+        let locked_receipt = engine.get_business_case(business_key);
+        assert!(locked_receipt.is_some());
+        assert_eq!(locked_receipt.unwrap().receipt_id, req1_id);
+
+        // 2. Submit second request with the same business_key while first is active -> Should fail with BusinessCaseLocked
+        let req2 = ServiceRequest::new("claims.process", token.clone(), serde_json::json!({ "amount": 600 }), None)
+            .with_business_key(business_key);
+
+        let err = engine.submit_service_request(req2).await;
+        match err {
+            Err(CoreError::BusinessCaseLocked(k, existing_id)) => {
+                assert_eq!(k, business_key);
+                assert_eq!(existing_id, req1_id);
+            }
+            other => panic!("Expected BusinessCaseLocked, got {:?}", other),
+        }
+
+        // 3. Complete first service -> Should release lock
+        let outcome = ServiceOutcome {
+            receipt_id: req1_id,
+            agent_id: "AGENT-CASE-01".into(),
+            service_name: "claims.process".into(),
+            completed_at: Utc::now().timestamp(),
+            result: serde_json::json!({ "status": "APPROVED" }),
+            blob_ref: None,
+        };
+        engine.complete_service(outcome).expect("Completion failed");
+
+        // Verify case lock is now freed
+        assert!(engine.get_business_case(business_key).is_none());
+
+        // 4. Submitting a new case under the same business_key should now succeed
+        let req3 = ServiceRequest::new("claims.process", token.clone(), serde_json::json!({ "amount": 700 }), None)
+            .with_business_key(business_key);
+        let receipt3 = engine.submit_service_request(req3).await.expect("Submit 3 failed");
+        assert_eq!(receipt3.business_key, Some(business_key.to_string()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_topology_and_partitioning() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_cluster_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        // 1. Initial topology
+        let topology = engine.get_cluster_topology();
+        assert_eq!(topology.nodes.len(), 1);
+        assert!(topology.nodes[0].is_leader);
+        assert_eq!(topology.total_partitions, 16);
+
+        // 2. Register peer node heartbeat
+        let peer_hb = PeerHeartbeatRequest {
+            node_id: "roviers-node-02".into(),
+            listen_addr: "http://10.0.0.2:8080".into(),
+            is_leader: false,
+            assigned_partitions: vec![8, 9, 10, 11, 12, 13, 14, 15],
+        };
+        engine.register_or_heartbeat_peer(peer_hb);
+
+        let updated_topology = engine.get_cluster_topology();
+        assert_eq!(updated_topology.nodes.len(), 2);
+
+        // 3. Test deterministic virtual partition calculation
+        let token = engine.issue_agent_token("AGENT-PART-01", "Agent", 86400).unwrap();
+        let req = ServiceRequest::new("test.svc", token, serde_json::json!({}), None)
+            .with_tenant("tenant-corp-x");
+        let partition = engine.calculate_partition(&req);
+        assert!(partition < 16);
+
+        // Same request calculates same partition
+        assert_eq!(engine.calculate_partition(&req), partition);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_tokens_and_security() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_scope_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        // 1. Issue token with restricted scopes
+        let token = engine
+            .issue_scoped_agent_token("AGENT-SCOPED-01", "Scoped Agent", 86400, vec!["tasks:read".into(), "tasks:write".into()], Some("tenant-42".into()))
+            .expect("Failed to issue scoped token");
+
+        assert_eq!(token.credentials.tenant_id, Some("tenant-42".into()));
+        assert_eq!(token.credentials.scopes, vec!["tasks:read".to_string(), "tasks:write".to_string()]);
+
+        // 2. Verify valid scope
+        assert!(engine.verify_scope(&token, "tasks:read").is_ok());
+        assert!(engine.verify_scope(&token, "tasks:write").is_ok());
+
+        // 3. Verify unauthorized scope
+        let scope_err = engine.verify_scope(&token, "admin:cluster");
+        assert!(matches!(scope_err, Err(CoreError::ScopeForbidden(_))));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

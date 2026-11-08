@@ -20,6 +20,9 @@ class RoviersReceipt:
     status: str
     estimated_ready_secs: Optional[int] = None
     callback_url: Optional[str] = None
+    business_key: Optional[str] = None
+    session_id: Optional[str] = None
+    partition_id: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> RoviersReceipt:
@@ -31,6 +34,9 @@ class RoviersReceipt:
             status=data["status"],
             estimated_ready_secs=data.get("estimated_ready_secs"),
             callback_url=data.get("callback_url"),
+            business_key=data.get("business_key"),
+            session_id=data.get("session_id"),
+            partition_id=data.get("partition_id"),
         )
 
 
@@ -118,6 +124,11 @@ class RoviersBrokerClient:
         service_name: str,
         payload: Dict[str, Any],
         callback_url: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        priority: Optional[int] = None,
+        business_key: Optional[str] = None,
+        traceparent: Optional[str] = None,
+        tracestate: Optional[str] = None,
     ) -> RoviersReceipt:
         """
         Dispatches a service request to the Broker ingress.
@@ -126,12 +137,22 @@ class RoviersBrokerClient:
         if not self.token_data:
             raise ValueError("Agent token must be provided before submitting requests.")
 
-        body = {
+        body: Dict[str, Any] = {
             "service_name": service_name,
             "agent_token": self.token_data,
             "payload": payload,
             "callback_url": callback_url,
         }
+        if tenant_id:
+            body["tenant_id"] = tenant_id
+        if priority is not None:
+            body["priority"] = priority
+        if business_key:
+            body["business_key"] = business_key
+        if traceparent:
+            body["traceparent"] = traceparent
+        if tracestate:
+            body["tracestate"] = tracestate
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
@@ -340,6 +361,94 @@ class RoviersBrokerClient:
                 json=payload,
             )
             resp.raise_for_status()
+
+    async def get_case(self, business_key: str) -> Optional[RoviersReceipt]:
+        """
+        Inspects active receipt currently holding a business case lock.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{self.base_url}/api/v1/cases/{business_key}")
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return RoviersReceipt.from_dict(resp.json())
+
+    async def release_case(self, business_key: str) -> bool:
+        """
+        Explicitly unlocks/releases a business case lock.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.delete(f"{self.base_url}/api/v1/cases/{business_key}")
+            resp.raise_for_status()
+            return bool(resp.json().get("released", False))
+
+    async def get_cluster_nodes(self) -> Dict[str, Any]:
+        """
+        Queries cluster node topology and partition assignments.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(f"{self.base_url}/api/v1/cluster/nodes")
+            resp.raise_for_status()
+            return resp.json()
+
+    async def peer_heartbeat(
+        self,
+        node_id: str,
+        listen_addr: str,
+        is_leader: bool = False,
+        assigned_partitions: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        """
+        Sends peer node heartbeat to the cluster topology leader.
+        """
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/api/v1/cluster/heartbeat",
+                json={
+                    "node_id": node_id,
+                    "listen_addr": listen_addr,
+                    "is_leader": is_leader,
+                    "assigned_partitions": assigned_partitions or [],
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def listen_tenant_signals(
+        self,
+        tenant_id: str,
+        timeout_secs: Optional[float] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Subscribes to tenant-scoped real-time SSE stream.
+        """
+        url = f"{self.base_url}/api/v1/tenants/{tenant_id}/stream"
+        timeout = httpx.Timeout(timeout_secs if timeout_secs else None, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("GET", url) as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data:"):
+                        raw = line[5:].strip()
+                        if raw:
+                            yield json.loads(raw)
+
+    async def listen_session_signals(
+        self,
+        session_id: str,
+        timeout_secs: Optional[float] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Subscribes to session-scoped real-time SSE stream for interactive HITL turns.
+        """
+        url = f"{self.base_url}/api/v1/sessions/{session_id}/stream"
+        timeout = httpx.Timeout(timeout_secs if timeout_secs else None, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("GET", url) as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data:"):
+                        raw = line[5:].strip()
+                        if raw:
+                            yield json.loads(raw)
 
     async def listen_signals(
         self,

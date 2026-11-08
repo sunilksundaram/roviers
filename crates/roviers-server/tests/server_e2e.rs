@@ -3,9 +3,10 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use roviers_core::RoviersEngine;
 use roviers_proto::{
-    BlobReference, CancellationRequest, ParkForInputRequest, Receipt, ReceiptStatus, ServiceOutcome,
-    ServiceRequest, SessionResumeRequest, SignedAgentToken, SignedResumeToken,
-    WorkerHeartbeatRequest, WorkerLeaseRequest, WorkerLeaseResponse,
+    BlobReference, CancellationRequest, ClusterTopologyResponse, ParkForInputRequest,
+    PeerHeartbeatRequest, Receipt, ReceiptStatus, ServiceOutcome, ServiceRequest,
+    SessionResumeRequest, SignedAgentToken, SignedResumeToken, WorkerHeartbeatRequest,
+    WorkerLeaseRequest, WorkerLeaseResponse,
 };
 use roviers_server::create_app;
 use std::sync::Arc;
@@ -768,6 +769,189 @@ async fn test_server_dlq_and_two_tier_blob_vault_http() {
         .await
         .unwrap();
     assert_eq!(reclaim_res.status(), StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_server_case_locking_and_cluster_http() {
+    let temp_dir = std::env::temp_dir().join(format!("roviers_case_cluster_test_{}", Uuid::now_v7()));
+    let engine = Arc::new(RoviersEngine::new(&temp_dir).expect("Failed to init engine"));
+    let app = create_app(Arc::clone(&engine));
+
+    // 1. Issue Agent Token
+    let auth_body = serde_json::to_vec(&serde_json::json!({
+        "agent_id": "AGENT-CASE-HTTP-01",
+        "agent_name": "Case Agent",
+        "validity_days": 30
+    }))
+    .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/agent")
+                .header("content-type", "application/json")
+                .body(Body::from(auth_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let token: SignedAgentToken = serde_json::from_slice(&bytes).unwrap();
+
+    // 2. Submit initial request with business_key
+    let business_key = "case:CLAIM-2026-X";
+    let req = ServiceRequest::new(
+        "insurance.claim",
+        token.clone(),
+        serde_json::json!({ "claim_id": "CLM-2026-X", "amount": 1200 }),
+        None,
+    )
+    .with_business_key(business_key);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/services/insurance.claim")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let receipt: Receipt = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(receipt.business_key, Some(business_key.to_string()));
+
+    // 3. GET /api/v1/cases/{business_key} -> returns active receipt
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/cases/{}", business_key))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let fetched_case: Receipt = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(fetched_case.receipt_id, receipt.receipt_id);
+
+    // 4. Submitting a duplicate request with the same business_key -> returns 409 CONFLICT
+    let dup_req = ServiceRequest::new(
+        "insurance.claim",
+        token.clone(),
+        serde_json::json!({ "claim_id": "CLM-2026-X", "amount": 1500 }),
+        None,
+    )
+    .with_business_key(business_key);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/services/insurance.claim")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&dup_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+
+    // 5. Cluster topology: GET /api/v1/cluster/nodes
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/cluster/nodes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let topology: ClusterTopologyResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(topology.nodes.len(), 1);
+
+    // 6. Cluster peer heartbeat: POST /api/v1/cluster/heartbeat
+    let peer_hb = PeerHeartbeatRequest {
+        node_id: "broker-node-02".into(),
+        listen_addr: "http://127.0.0.1:9091".into(),
+        is_leader: false,
+        assigned_partitions: vec![8, 9, 10, 11, 12, 13, 14, 15],
+    };
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/cluster/heartbeat")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&peer_hb).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Verify updated topology has 2 nodes
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/cluster/nodes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let topology2: ClusterTopologyResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(topology2.nodes.len(), 2);
+
+    // 7. Explicitly release business case lock: DELETE /api/v1/cases/{business_key}
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/cases/{}", business_key))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 8. GET /api/v1/cases/{business_key} now returns 404 NOT_FOUND
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/cases/{}", business_key))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

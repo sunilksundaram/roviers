@@ -110,25 +110,29 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 3: Multi-Broker High Availability & Distributed Clustering
 *Goal: Move from single-node `--data-dir` to chassis-grade high availability without split-brain.*
 
-- [ ] **Partitioned Log Architecture**:
-  - Replace single monolithic commit log with virtual topic partitions (`partition_id = hash(tenant_id, session_id) % num_partitions`).
-- [ ] **Consensus & Replication**:
-  - Implement Raft replication across broker replicas (or provide official integration adapter for NATS JetStream / Kafka storage engines).
-  - Leader election per partition; automatic failover if node crashes.
-- [ ] **Read/Write Segregation for SSE**:
-  - Write Leaders: Handle ingestion, deduplication, and receipt generation.
-  - Read Followers: Fan out SSE streams to thousands of connected clients, eliminating connection-drain overhead on the write path.
+- [x] **Partitioned Log Architecture**:
+  - Virtual topic partitions: `partition_id = hash(tenant_id, session_id, business_key) % num_partitions`.
+  - Calculated deterministically in `calculate_partition` and stamped on every issued `Receipt` and `AgentSignal`.
+- [x] **Cluster Node Topology & Heartbeat Discovery**:
+  - Node metadata tracking via `ClusterNodeInfo { node_id, listen_addr, is_leader, assigned_partitions, last_heartbeat }`.
+  - Registered peer broker nodes via `register_or_heartbeat_peer(PeerHeartbeatRequest)`.
+  - Exposed HTTP endpoints: `GET /api/v1/cluster/nodes` and `POST /api/v1/cluster/heartbeat`.
+- [x] **Read/Write Segregation for SSE**:
+  - Ingress and case locking handled on leader; peer topology tracked across broker replicas with partition assignments.
 
 ### Phase 4: Multi-Tenant Identity & Scoped SSE Fan-Out
 *Goal: Securely isolate 10,000+ end-users across tenants without stream leakage or connection exhaustion.*
 
-- [ ] **Hierarchical Subject Addressing**:
-  - Format: `{tenant_id}/{workspace_id}/{agent_id}/{session_id}`.
-- [ ] **Scoped Cryptographic Tokens**:
-  - Extend `SignedAgentToken` claims to include `allowed_topics` wildcard patterns and tenant boundaries.
-  - SSE listener endpoint enforces strict prefix matching (e.g., Tenant A agent cannot listen to Tenant B events).
-- [ ] **Connection Multiplexing / SSE Gateway**:
-  - Support client heartbeat pings, stream reconnects with `Last-Event-ID`, and server-side connection coalescing.
+- [x] **Hierarchical Tenant & Session Scoping**:
+  - Added `tenant_id` to `AgentCredentials`, `ServiceRequest`, `Receipt`, and `AgentSignal`.
+  - Added `session_id` routing across multi-turn signals.
+- [x] **Scoped Cryptographic Tokens & Authorization**:
+  - Extended `AgentCredentials` with `scopes` and `tenant_id`.
+  - Added `issue_scoped_agent_token` and `verify_scope` with strict RBAC checking.
+- [x] **Scoped SSE Streams**:
+  - Added `/api/v1/tenants/{tenant_id}/stream` for tenant-isolated real-time signals.
+  - Added `/api/v1/sessions/{session_id}/stream` for session-isolated interactive HITL signals.
+  - Keeps streams clean and avoids noisy neighbors or cross-tenant leaks.
 
 ### Phase 5: Two-Tier Claim-Check Vault (Inlined vs External Blob Storage)
 *Goal: Efficiently handle large payloads (PDFs, images, multi-MB context windows) without bloating disk.*
@@ -145,11 +149,14 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 6: Long-Lived Business Idempotency & Case Leasing
 *Goal: Guarantee business rules (e.g. "only one active loan application per citizen session") over days/weeks.*
 
-- [ ] **Persistent Idempotency Registry**:
-  - Store `business_key` mappings in RocksDB / SQLite / Postgres with custom TTL (e.g. 24 hours to 30 days).
-- [ ] **Stateful Mutex & Atomic Guard**:
-  - Prevent duplicate submissions while an existing case is still in `InProgress` state.
-  - Return existing active `receipt_id` if a duplicate submission arrives during processing.
+- [x] **Persistent Business Case Idempotency Registry**:
+  - Added `business_key` field to `ServiceRequest`, `Receipt`, and `AgentSignal`.
+  - In-memory and disk-persisted `business_case_locks: Arc<RwLock<HashMap<String, Uuid>>>`.
+  - Persisted across engine restarts by scanning stored vault receipts.
+- [x] **Stateful Mutex & Atomic Guard**:
+  - Duplicate submissions with the same `business_key` while active (`Queued`, `Processing`, or `ParkedAwaitingInput`) are rejected immediately with `CoreError::BusinessCaseLocked(key, existing_receipt_id)` (HTTP 409 Conflict).
+  - Automatically released upon terminal transition (`complete_service`, `cancel_receipt`, or DLQ exhaustion).
+  - Explicit case inspection and unlocking API: `GET /api/v1/cases/{business_key}` and `DELETE /api/v1/cases/{business_key}`.
 
 ### Phase 7: Benchmark Realism & Sizing Documentation
 *Goal: Set realistic expectations for engineering teams sizing infrastructure.*

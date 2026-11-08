@@ -26,6 +26,8 @@ pub struct AgentCredentials {
     pub issued_at: i64,
     pub expires_at: i64,
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl AgentCredentials {
@@ -41,6 +43,7 @@ impl AgentCredentials {
             issued_at: now,
             expires_at: now + validity_secs,
             scopes: vec!["service:all".into()],
+            tenant_id: None,
         }
     }
 
@@ -114,6 +117,12 @@ pub struct ServiceRequest {
     pub tenant_id: Option<String>,
     #[serde(default)]
     pub priority: Option<u8>,
+    #[serde(default)]
+    pub business_key: Option<String>,
+    #[serde(default)]
+    pub traceparent: Option<String>,
+    #[serde(default)]
+    pub tracestate: Option<String>,
 }
 
 impl ServiceRequest {
@@ -132,6 +141,9 @@ impl ServiceRequest {
             session_turn: None,
             tenant_id: None,
             priority: None,
+            business_key: None,
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -151,6 +163,17 @@ impl ServiceRequest {
             turn_id,
             parent_receipt_id: parent,
         });
+        self
+    }
+
+    pub fn with_business_key(mut self, key: impl Into<String>) -> Self {
+        self.business_key = Some(key.into());
+        self
+    }
+
+    pub fn with_tracing(mut self, traceparent: impl Into<String>, tracestate: Option<String>) -> Self {
+        self.traceparent = Some(traceparent.into());
+        self.tracestate = tracestate;
         self
     }
 }
@@ -310,6 +333,16 @@ pub struct Receipt {
     pub delivery_attempts: u32,
     #[serde(default)]
     pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub business_key: Option<String>,
+    #[serde(default)]
+    pub traceparent: Option<String>,
+    #[serde(default)]
+    pub tracestate: Option<String>,
+    #[serde(default)]
+    pub partition_id: Option<u32>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl Receipt {
@@ -324,6 +357,11 @@ impl Receipt {
             callback_url: req.callback_url.clone(),
             delivery_attempts: 0,
             tenant_id: req.tenant_id.clone(),
+            business_key: req.business_key.clone(),
+            traceparent: req.traceparent.clone(),
+            tracestate: req.tracestate.clone(),
+            partition_id: None,
+            session_id: req.session_turn.as_ref().map(|s| s.session_id.clone()),
         }
     }
 }
@@ -395,6 +433,46 @@ pub struct AgentSignal {
     pub message: String,
     pub pickup_url: String,
     pub timestamp: i64,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub business_key: Option<String>,
+    #[serde(default)]
+    pub traceparent: Option<String>,
+    #[serde(default)]
+    pub tracestate: Option<String>,
+    #[serde(default)]
+    pub partition_id: Option<u32>,
+}
+
+/// Cluster Broker Node metadata for multi-broker High Availability (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterNodeInfo {
+    pub node_id: String,
+    pub listen_addr: String,
+    pub is_leader: bool,
+    pub assigned_partitions: Vec<u32>,
+    pub last_heartbeat: i64,
+}
+
+/// Request to register or heartbeat a broker peer in the cluster
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHeartbeatRequest {
+    pub node_id: String,
+    pub listen_addr: String,
+    pub is_leader: bool,
+    pub assigned_partitions: Vec<u32>,
+}
+
+/// Cluster topology response containing current active broker nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterTopologyResponse {
+    pub cluster_id: String,
+    pub leader_node_id: Option<String>,
+    pub total_partitions: u32,
+    pub nodes: Vec<ClusterNodeInfo>,
 }
 
 // Backwards-compatibility aliases
@@ -436,6 +514,7 @@ mod tests {
             issued_at: Utc::now().timestamp() - 7200,
             expires_at: Utc::now().timestamp() - 3600,
             scopes: vec!["all".into()],
+            tenant_id: None,
         };
         let expired_token =
             SignedAgentToken::issue(expired_creds, &signing_key).expect("Token issue failed");

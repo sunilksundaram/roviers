@@ -4,6 +4,7 @@ export interface AgentCredentials {
   issued_at: number;
   expires_at: number;
   scopes: string[];
+  tenant_id?: string;
 }
 
 export interface SignedAgentToken {
@@ -19,6 +20,11 @@ export interface RoviersReceipt {
   status: 'Queued' | 'Processing' | 'ReadyForPickup' | 'Fulfilled' | { Failed: string };
   estimated_ready_secs?: number;
   callback_url?: string;
+  business_key?: string;
+  session_id?: string;
+  partition_id?: number;
+  traceparent?: string;
+  tracestate?: string;
 }
 
 export interface BlobReference {
@@ -57,6 +63,27 @@ export interface WorkerLeaseResponse {
   lease_expires_at: number;
 }
 
+export interface ClusterNodeInfo {
+  node_id: string;
+  listen_addr: string;
+  is_leader: boolean;
+  assigned_partitions: number[];
+  last_heartbeat: number;
+}
+
+export interface ClusterTopologyResponse {
+  cluster_id: string;
+  nodes: ClusterNodeInfo[];
+  total_partitions: number;
+}
+
+export interface PeerHeartbeatRequest {
+  node_id: string;
+  listen_addr: string;
+  is_leader: boolean;
+  assigned_partitions: number[];
+}
+
 export interface RoviersOutcome<T = any> {
   receipt_id: string;
   agent_id: string;
@@ -75,6 +102,12 @@ export interface AgentSignal {
   message: string;
   pickup_url: string;
   timestamp: number;
+  tenant_id?: string;
+  session_id?: string;
+  business_key?: string;
+  traceparent?: string;
+  tracestate?: string;
+  partition_id?: number;
 }
 
 // Backwards-compatibility aliases

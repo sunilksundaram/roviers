@@ -8,7 +8,8 @@ use axum::{
 use futures::stream::Stream;
 use roviers_core::RoviersEngine;
 use roviers_proto::{
-    BlobReference, CancellationRequest, ParkForInputRequest, Receipt, ServiceBackoff, ServiceOutcome,
+    BlobReference, CancellationRequest, ClusterTopologyResponse,
+    ParkForInputRequest, PeerHeartbeatRequest, Receipt, ServiceBackoff, ServiceOutcome,
     ServiceRequest, SessionResumeRequest, SetBackoffRequest, SignedAgentToken, SignedResumeToken,
     WorkerHeartbeatRequest, WorkerLeaseRequest, WorkerLeaseResponse,
 };
@@ -89,16 +90,29 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
         .route("/api/v1/sessions/{session_id}/resume", post(resume_session))
         // In-Flight Task Cancellation
         .route("/api/v1/receipts/{receipt_id}/cancel", post(cancel_receipt))
+        // Business Key Idempotency & Case Locking
+        .route("/api/v1/cases/{business_key}", get(get_business_case).delete(release_business_case))
         // Worker Capacity Leases & Heartbeats
         .route("/api/v1/workers/lease", post(lease_tasks))
         .route("/api/v1/workers/heartbeat", post(worker_heartbeat))
         .route("/api/v1/workers/reclaim", post(reclaim_expired_leases))
+        // Cluster HA & Node Topology
+        .route("/api/v1/cluster/nodes", get(get_cluster_nodes))
+        .route("/api/v1/cluster/heartbeat", post(cluster_peer_heartbeat))
         // Dead Letter Queue
         .route("/api/v1/dlq", get(list_dlq))
         // SSE Real-Time Completion Signals
         .route(
             "/api/v1/agents/{agent_id}/stream",
             get(stream_agent_signals),
+        )
+        .route(
+            "/api/v1/tenants/{tenant_id}/stream",
+            get(stream_tenant_signals),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/stream",
+            get(stream_session_signals),
         )
         .route(
             "/api/v1/agents/{agent_id}/receipts",
@@ -146,6 +160,17 @@ pub async fn submit_service(
         Err(roviers_core::CoreError::Auth(e)) => Err((StatusCode::UNAUTHORIZED, e.to_string())),
         Err(roviers_core::CoreError::DuplicateRequest(id)) => {
             Err((StatusCode::CONFLICT, format!("Duplicate request: {}", id)))
+        }
+        Err(roviers_core::CoreError::BusinessCaseLocked(k, id)) => {
+            Err((
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "BusinessCaseLocked",
+                    "business_key": k,
+                    "existing_receipt_id": id
+                })
+                .to_string(),
+            ))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
@@ -413,6 +438,95 @@ pub async fn stream_citizen_signals(
     Path(citizen_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     stream_agent_signals(State(state), Path(citizen_id)).await
+}
+
+/// Tenant-scoped real-time SSE signal stream
+pub async fn stream_tenant_signals(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.engine.subscribe_signals();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let expected_tenant = tenant_id.clone();
+        match item {
+            Ok(signal) => {
+                if signal.tenant_id.as_deref() == Some(&expected_tenant) {
+                    let json = serde_json::to_string(&signal).unwrap_or_default();
+                    Some(Ok(Event::default().event("signal").data(json)))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Session-scoped real-time SSE signal stream (for sticky interactive HITL turns)
+pub async fn stream_session_signals(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.engine.subscribe_signals();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let expected_session = session_id.clone();
+        match item {
+            Ok(signal) => {
+                if signal.session_id.as_deref() == Some(&expected_session) {
+                    let json = serde_json::to_string(&signal).unwrap_or_default();
+                    Some(Ok(Event::default().event("signal").data(json)))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Retrieve the active receipt currently leasing a business key
+pub async fn get_business_case(
+    State(state): State<AppState>,
+    Path(business_key): Path<String>,
+) -> Result<Json<Receipt>, StatusCode> {
+    state
+        .engine
+        .get_business_case(&business_key)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Explicitly unlock/release a business key lock
+pub async fn release_business_case(
+    State(state): State<AppState>,
+    Path(business_key): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let released = state.engine.release_business_case(&business_key);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "business_key": business_key, "released": released })),
+    )
+}
+
+/// Retrieve the active cluster node topology and partition assignments
+pub async fn get_cluster_nodes(State(state): State<AppState>) -> Json<ClusterTopologyResponse> {
+    Json(state.engine.get_cluster_topology())
+}
+
+/// Register or renew a peer broker node heartbeat
+pub async fn cluster_peer_heartbeat(
+    State(state): State<AppState>,
+    Json(req): Json<PeerHeartbeatRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    state.engine.register_or_heartbeat_peer(req);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "acknowledged" })),
+    )
 }
 
 /// Background worker simulation:

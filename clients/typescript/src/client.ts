@@ -7,12 +7,23 @@ import {
   SignedResumeToken,
   ServiceBackoff,
   WorkerLeaseResponse,
+  ClusterTopologyResponse,
+  PeerHeartbeatRequest,
 } from './types';
 
 export interface RoviersBrokerOptions {
   baseUrl?: string;
   token?: SignedAgentToken;
   timeoutMs?: number;
+}
+
+export interface SubmitOptions {
+  callbackUrl?: string;
+  tenantId?: string;
+  priority?: number;
+  businessKey?: string;
+  traceparent?: string;
+  tracestate?: string;
 }
 
 export class RoviersBrokerClient {
@@ -78,21 +89,30 @@ export class RoviersBrokerClient {
   async submit<T = any>(
     serviceName: string,
     payload: T,
-    callbackUrl?: string
+    options?: string | SubmitOptions
   ): Promise<RoviersReceipt> {
     if (!this.token) {
       throw new Error('A valid SignedAgentToken is required before submitting requests.');
     }
 
+    const opts: SubmitOptions = typeof options === 'string' ? { callbackUrl: options } : options || {};
+
+    const body: Record<string, any> = {
+      service_name: serviceName,
+      agent_token: this.token,
+      payload,
+      callback_url: opts.callbackUrl || null,
+    };
+    if (opts.tenantId) body.tenant_id = opts.tenantId;
+    if (opts.priority !== undefined) body.priority = opts.priority;
+    if (opts.businessKey) body.business_key = opts.businessKey;
+    if (opts.traceparent) body.traceparent = opts.traceparent;
+    if (opts.tracestate) body.tracestate = opts.tracestate;
+
     const res = await fetch(`${this.baseUrl}/api/v1/services/${serviceName}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        service_name: serviceName,
-        agent_token: this.token,
-        payload,
-        callback_url: callbackUrl || null,
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 
@@ -101,6 +121,150 @@ export class RoviersBrokerClient {
     }
 
     return (await res.json()) as RoviersReceipt;
+  }
+
+  /**
+   * Retrieve active receipt currently leasing a business key.
+   */
+  async getCase(businessKey: string): Promise<RoviersReceipt | null> {
+    const res = await fetch(`${this.baseUrl}/api/v1/cases/${encodeURIComponent(businessKey)}`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      throw new Error(`Failed to fetch case ${businessKey}: ${res.status}`);
+    }
+
+    return (await res.json()) as RoviersReceipt;
+  }
+
+  /**
+   * Explicitly release a business case lock.
+   */
+  async releaseCase(businessKey: string): Promise<boolean> {
+    const res = await fetch(`${this.baseUrl}/api/v1/cases/${encodeURIComponent(businessKey)}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Failed to release case ${businessKey}: ${res.status}`);
+    }
+
+    const data = await res.json();
+    return Boolean(data.released);
+  }
+
+  /**
+   * Retrieve cluster node topology and partition assignments.
+   */
+  async getClusterNodes(): Promise<ClusterTopologyResponse> {
+    const res = await fetch(`${this.baseUrl}/api/v1/cluster/nodes`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Failed to fetch cluster topology: ${res.status}`);
+    }
+
+    return (await res.json()) as ClusterTopologyResponse;
+  }
+
+  /**
+   * Send heartbeat to cluster leader.
+   */
+  async peerHeartbeat(req: PeerHeartbeatRequest): Promise<{ status: string }> {
+    const res = await fetch(`${this.baseUrl}/api/v1/cluster/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Peer heartbeat failed: ${res.status}`);
+    }
+
+    return (await res.json()) as { status: string };
+  }
+
+  /**
+   * Subscribe to tenant-scoped real-time SSE stream.
+   */
+  listenTenantSignals(tenantId: string, onSignal: (signal: AgentSignal) => void): () => void {
+    const url = `${this.baseUrl}/api/v1/tenants/${encodeURIComponent(tenantId)}/stream`;
+    const controller = new AbortController();
+
+    fetch(url, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.body) return;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data:')) {
+              try {
+                const signal: AgentSignal = JSON.parse(line.slice(5).trim());
+                onSignal(signal);
+              } catch {
+                // Ignore partial JSON
+              }
+            }
+          }
+        }
+      })
+      .catch(() => {});
+
+    return () => controller.abort();
+  }
+
+  /**
+   * Subscribe to session-scoped real-time SSE stream (for interactive HITL turns).
+   */
+  listenSessionSignals(sessionId: string, onSignal: (signal: AgentSignal) => void): () => void {
+    const url = `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/stream`;
+    const controller = new AbortController();
+
+    fetch(url, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.body) return;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data:')) {
+              try {
+                const signal: AgentSignal = JSON.parse(line.slice(5).trim());
+                onSignal(signal);
+              } catch {
+                // Ignore partial JSON
+              }
+            }
+          }
+        }
+      })
+      .catch(() => {});
+
+    return () => controller.abort();
   }
 
   /**
