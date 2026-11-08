@@ -13,7 +13,7 @@ This document tracks identified architectural gaps, real-world multi-agent failu
 | **GAP-3** | **Interactive HITL & Provider Q&A** | One-way `callback_url` or single claim-check pickup. | Multi-turn Human-In-The-Loop (HITL) workflows park awaiting input. Subsequent user answers route to different workers, causing "no waiter / 404" failures. | Session Rendezvous Protocol with stateful `resume_token`, parked state machine (`AwaitingInput`), and distributed turn correlation. |
 | **GAP-4** | **Large Binary & Blob Vaulting** | In-memory cache + local filesystem disk vault (`/vault/{receipt_id}.json`). | Storing large quote templates, PDFs, multi-MB prompt artifacts, or images bloats the local disk and degrades broker performance. | Two-tier Claim-Check: inline JSON (<64KB) vs Blob Storage (S3 / GCS / Azure Blob) with presigned URLs and Blake3/SHA256 integrity proofs. |
 | **GAP-5** | **Business Key Idempotency** | Sliding window ring-buffer (default 1M entries, ~60s retention under heavy burst). | Transient retries succeed, but multi-hour / multi-day business processes ("one open claim per user session") cannot be enforced. | Persistent Business Case Leasing (`business_key` + distributed lease lock with configurable TTL up to 30 days). |
-| **GAP-6** | **LLM Quota Stampedes & Backpressure** | Roviers accepts all requests up to broker network/disk I/O ceiling. | Workers concurrently picking tasks stampede upstream LLM rate limits (Azure OpenAI TPM/RPM, Apister inflight limits), triggering cascading 429 errors. | Quota-aware admission control, token-bucket rate limiters per upstream model, and worker capacity leases. |
+| **GAP-6** | **Downstream Service Backpressure & Quota Stampedes** | Roviers accepts all requests up to broker network/disk I/O ceiling without awareness of downstream service speeds. | Downstream services (slow legacy ERPs, payment gateways, heavy DB analytical queries, sandboxed runtimes, or LLM APIs) get overwhelmed, leading to connection exhaustion, cascading 429/503 errors, and catastrophic collapse. | Generalized service backpressure engine: dynamic set/unset backoff controls (`POST /services/{name}/backoff`), per-service concurrency & rate caps, and durable queue holding in append-only storage. |
 | **GAP-7** | **Benchmark Realism & Sizing** | Raw ingestion/SSE tested at 100k+ ops/sec. | Ingress throughput gives a false sense of capacity; actual system throughput is constrained by LLM inference (10-50 turns/sec/cluster). | Tiered benchmark suite distinguishing **Broker Ingress Throughput** from **Chassis End-to-End Orchestration Capacity**. |
 | **GAP-8** | **Worker Crash, Lease Expiration & DLQ** | No worker heartbeat or lease timeout on in-flight tasks. | Worker crash (Kubernetes OOMKill, spot eviction) leaves task stuck in `Processing` forever; poison pills crash repeated workers in an infinite loop. | Ephemeral worker leases with heartbeat renewal (`keepalive`), automatic lease reclaim, and Dead Letter Queue (DLQ) after $N$ failed attempts. |
 | **GAP-9** | **In-Flight Cancellation & Client Abort** | No mechanism to cancel a running task or revoke an issued receipt. | User cancels prompt in UI or evaluator prunes an agent branch, but worker continues expensive 30s LLM inference loop, burning quota. | First-class cancellation API (`POST /receipts/{id}/cancel`), SSE `AbortSignal` broadcast, and cooperative token cancellation in client SDKs. |
@@ -33,12 +33,17 @@ User A ────► Roviers Ingress ────► Worker 1 picks task
                                         │
 User A sends answer ───► Gateway ───► Worker 2 (Agent 2) ──► 💥 404 / No Waiter Found!
 
-[FAILURE SCENARIO 2: Worker Quota Stampede]
-500 Clients ──► Roviers (Queues instantly @ 100k/s)
-                     │
-         50 Worker Nodes pull simultaneously
-                     │
-          All call Azure OpenAI (TPM: 120k) ──► 💥 Cascading HTTP 429 Too Many Requests!
+[FAILURE SCENARIO 2: Downstream Service Stampede & Slow Dependency Collapse]
+5,000 Clients ──► Roviers (Ingests instantly @ 100k/s into memory/disk)
+                       │
+         50 Worker Nodes pull simultaneously without backpressure
+                       │
+    ┌──────────────────┴──────────────────────────────────────┐
+    │                                                         │
+    ▼                                                         ▼
+Legacy Mainframe / ERP (Max 5 conn)              Payment / LLM API (Rate Limit 100 QPS)
+💥 Connection pool exhausted!                      💥 Cascading HTTP 429/503 Rate Limited!
+💥 30s connection timeouts!                        💥 Subsequent retries amplify the stampede!
 
 [FAILURE SCENARIO 3: Worker Node Crash & Zombie Tasks]
 Client ────► Roviers (Dispatches Task-X) ────► Worker Node A
@@ -74,24 +79,49 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
     1. **Sticky Routing**: Route resumption signal directly to the worker holding the in-memory agent.
     2. **Stateless Checkpointing (Recommended)**: Worker checkpoints agent memory (e.g. LangGraph state) to persistent storage upon parking; any worker can pick up the resumption turn.
 
-### Phase 2: Upstream LLM Quota-Aware Leases & Adaptive Backpressure
-*Goal: Prevent agent worker stampedes against shared LLM API limits (TPM / RPM / Inflight).*
+### Phase 2: Generalized Service Backpressure, Queue Holding & Adaptive Backoff
+*Goal: Protect slow, fragile, or rate-limited downstream dependencies (legacy mainframes, ERPs, payment gateways, heavy DBs, sandboxes, and LLMs) from worker stampedes.*
 
-- [ ] **Broker-Managed Capacity Leases**:
-  - Introduce `WorkerHeartbeat` with capacity telemetry (`available_slots`, `active_turns`).
-  - Workers lease tasks using `/api/v1/workers/lease` rather than blind polling.
-- [ ] **Token Bucket Rate Limiting per Provider**:
-  - Add configuration block in `roviers.toml` for upstream model budgets:
+- [ ] **Durable Queue Holding & Ingress Shock Absorber**:
+  - Roviers continues ingesting client requests at wire speed (100k+ req/s), committing them sequentially to the append-only ledger on disk.
+  - Clients immediately receive their HTTP 202 Claim-Check Receipt and release connection sockets.
+  - When downstream services are slow or backed off, requests remain durably parked on disk without consuming active sockets, worker threads, or leaking memory.
+- [ ] **Dynamic Set / Unset Backoff Controls**:
+  - **Set Backoff API**: `POST /api/v1/services/{service_name}/backoff`
+    - Triggered by workers detecting upstream 429/503/timeouts, or by external health monitors:
+      ```json
+      {
+        "duration_secs": 60,
+        "reason": "Legacy ERP connection pool saturation / DB maintenance",
+        "concurrency_cap": 2
+      }
+      ```
+    - Immediately pauses or restricts worker dispatch for that service while continuing safe ingestion.
+  - **Unset Backoff / Resume API**: `POST /api/v1/services/{service_name}/resume`
+    - Instantly clears backoff status and resumes dispatching held queued tasks.
+- [ ] **Circuit Breaker State Machine**:
+  - Three distinct states per service:
+    1. `Normal`: Dispatches at configured steady-state concurrency.
+    2. `BackingOff`: Dispatching completely held until timer expires; queue grows safely on disk.
+    3. `HalfOpen`: Probes downstream service with single canary tasks to confirm recovery before ramping back to full throughput.
+- [ ] **Dynamic Receipt ETA Adaptation**:
+  - When a service is backed off, newly issued receipts automatically calculate adjusted `estimated_ready_secs = base_latency + remaining_backoff_duration`.
+- [ ] **Per-Service Concurrency & Rate Caps**:
+  - Configurable in `roviers.toml`:
     ```toml
-    [upstream_limits.azure_openai_gpt4o]
-    max_tpm = 120_000
-    max_rpm = 1_200
-    max_inflight_turns = 40
+    [services.legacy_erp_sync]
+    max_inflight = 5              # Never open more than 5 concurrent worker connections
+    rate_limit_per_sec = 2        # Max 2 calls/sec
+    auto_backoff_on_503 = true
+    backoff_duration_secs = 45
+
+    [services.payment_settlement]
+    max_inflight = 20
+    rate_limit_per_sec = 50
+
+    [services.heavy_warehouse_query]
+    max_inflight = 2              # Prevent analytical queries from hammering DB
     ```
-  - Roviers estimates or tracks tokens per request and throttles task dispatch into the worker pool.
-- [ ] **Prioritized Task Queuing**:
-  - Interactive user turns receive `Priority::High`; background batch tasks receive `Priority::Low`.
-  - When LLM quota is near exhaustion, hold background tasks while serving interactive user turns.
 
 ### Phase 3: Multi-Broker High Availability & Distributed Clustering
 *Goal: Move from single-node `--data-dir` to chassis-grade high availability without split-brain.*

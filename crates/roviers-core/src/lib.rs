@@ -424,13 +424,13 @@ mod tests {
         assert_eq!(receipt.status, ReceiptStatus::Queued);
 
         // 4. Test Idempotency (Duplicate submission rejected immediately)
-        let dup_request = ServiceRequest {
-            request_id: req_id,
-            service_name: "treasury.mint_bond".into(),
-            agent_token: agent_token.clone(),
-            payload: serde_json::json!({ "denomination": 1000 }),
-            callback_url: None,
-        };
+        let mut dup_request = ServiceRequest::new(
+            "treasury.mint_bond",
+            agent_token.clone(),
+            serde_json::json!({ "denomination": 1000 }),
+            None,
+        );
+        dup_request.request_id = req_id;
         let dup_err = engine.submit_service_request(dup_request).await;
         assert!(matches!(dup_err, Err(CoreError::DuplicateRequest(_))));
 
