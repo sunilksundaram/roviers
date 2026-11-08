@@ -217,6 +217,41 @@ pub struct SessionResumeRequest {
     pub agent_token: SignedAgentToken,
 }
 
+/// Request to park an active task awaiting human or agent clarification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParkForInputRequest {
+    pub receipt_id: Uuid,
+    pub question: String,
+    pub schema_for_answer: Option<serde_json::Value>,
+    pub checkpoint_uri: Option<String>,
+    pub ttl_secs: Option<i64>,
+}
+
+/// Request to cancel an in-flight receipt
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancellationRequest {
+    pub receipt_id: Uuid,
+    pub agent_token: SignedAgentToken,
+    pub reason: Option<String>,
+}
+
+/// Dynamic backpressure & circuit-breaker status for a service
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceBackoff {
+    pub service_name: String,
+    pub backed_off_until: i64,
+    pub reason: String,
+    pub concurrency_cap: usize,
+}
+
+/// Request to set or update dynamic backoff on a service
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetBackoffRequest {
+    pub duration_secs: u64,
+    pub reason: String,
+    pub concurrency_cap: Option<usize>,
+}
+
 /// Worker capacity lease request to prevent LLM quota stampedes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerLeaseRequest {
@@ -225,6 +260,14 @@ pub struct WorkerLeaseRequest {
     pub max_tasks: usize,
     pub available_tpm_budget: Option<u64>,
     pub active_inflight: usize,
+}
+
+/// Worker heartbeat keepalive request to maintain active lease
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerHeartbeatRequest {
+    pub worker_id: String,
+    pub lease_id: Uuid,
+    pub extend_secs: Option<i64>,
 }
 
 /// Granted lease of tasks for a worker node

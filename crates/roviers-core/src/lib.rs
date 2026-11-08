@@ -3,8 +3,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use roviers_ledger::{DedupLog, Ledger, LedgerError, TopicTrie};
 use roviers_proto::{
-    AgentCredentials, AgentSignal, ProtoError, Receipt, ReceiptStatus, ServiceOutcome,
-    ServiceRequest, SignedAgentToken,
+    AgentCredentials, AgentSignal, ProtoError, Receipt, ReceiptStatus, ResumePayload,
+    ServiceBackoff, ServiceOutcome, ServiceRequest, SessionResumeRequest, SignedAgentToken,
+    SignedResumeToken, WorkerLeaseRequest, WorkerLeaseResponse,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ pub enum CoreError {
     AgentMismatch,
     #[error("Outcome for receipt {0} is not ready yet")]
     OutcomeNotReady(Uuid),
+    #[error("Receipt {0} is not parked awaiting input")]
+    NotParked(Uuid),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("IO error: {0}")]
@@ -38,6 +41,16 @@ pub enum CoreError {
 pub const CitizenMismatch: fn() -> CoreError = || CoreError::AgentMismatch;
 #[allow(non_upper_case_globals)]
 pub const ClientMismatch: fn() -> CoreError = || CoreError::AgentMismatch;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActiveWorkerLease {
+    pub lease_id: Uuid,
+    pub worker_id: String,
+    pub service_filter: Option<String>,
+    pub task_ids: Vec<Uuid>,
+    pub granted_at: i64,
+    pub expires_at: i64,
+}
 
 /// The core broker engine
 pub struct RoviersEngine {
@@ -54,6 +67,8 @@ pub struct RoviersEngine {
     vault_dir: PathBuf,
     receipts: Arc<RwLock<HashMap<Uuid, Receipt>>>,
     outcomes: Arc<RwLock<HashMap<Uuid, ServiceOutcome>>>,
+    pub service_backoffs: Arc<RwLock<HashMap<String, ServiceBackoff>>>,
+    pub worker_leases: Arc<RwLock<HashMap<Uuid, ActiveWorkerLease>>>,
     signal_bus: broadcast::Sender<AgentSignal>,
     http_client: reqwest::Client,
 }
@@ -139,6 +154,8 @@ impl RoviersEngine {
             vault_dir,
             receipts: Arc::new(RwLock::new(receipts_map)),
             outcomes: Arc::new(RwLock::new(outcomes_map)),
+            service_backoffs: Arc::new(RwLock::new(HashMap::new())),
+            worker_leases: Arc::new(RwLock::new(HashMap::new())),
             signal_bus,
             http_client,
         })
@@ -204,8 +221,19 @@ impl RoviersEngine {
             l.append(&topic, &req_id_str, &payload_bytes)?
         };
 
-        // Step 4: Issue the Receipt (Claim-Check Token)
-        let receipt = Receipt::from_request(&request, Some(5));
+        // Step 4: Issue the Receipt (Claim-Check Token) with dynamic ETA accounting for active service backoff
+        let estimated_ready_secs = if let Some(backoff) = self.get_service_backoff(&request.service_name) {
+            let now = Utc::now().timestamp();
+            if backoff.backed_off_until > now {
+                Some(5 + (backoff.backed_off_until - now) as u64)
+            } else {
+                Some(5)
+            }
+        } else {
+            Some(5)
+        };
+
+        let receipt = Receipt::from_request(&request, estimated_ready_secs);
 
         {
             let mut r = self.receipts.write().unwrap();
@@ -344,6 +372,320 @@ impl RoviersEngine {
         }
 
         Ok(outcome.clone())
+    }
+
+    /// Worker parks a task awaiting interactive human or agent clarification (HITL).
+    /// Generates and returns an Ed25519-signed ResumeToken containing session context.
+    pub fn park_for_input(
+        &self,
+        receipt_id: Uuid,
+        question: String,
+        schema_for_answer: Option<serde_json::Value>,
+        checkpoint_uri: Option<String>,
+        ttl_secs: i64,
+    ) -> Result<SignedResumeToken, CoreError> {
+        let mut receipts = self.receipts.write().unwrap();
+        let receipt = receipts
+            .get_mut(&receipt_id)
+            .ok_or(CoreError::ReceiptNotFound(receipt_id))?;
+
+        receipt.status = ReceiptStatus::ParkedAwaitingInput {
+            question: question.clone(),
+            schema_for_answer: schema_for_answer.clone(),
+        };
+
+        // Persist updated status to disk vault
+        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
+        if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+            let _ = std::fs::write(receipt_path, data);
+        }
+
+        let agent_id = receipt.agent_id.clone();
+        let service_name = receipt.service_name.clone();
+        let session_id = format!("sess-{}", receipt_id);
+
+        let resume_payload = ResumePayload {
+            session_id: session_id.clone(),
+            turn_id: 1,
+            receipt_id,
+            question: question.clone(),
+            schema_for_answer,
+            checkpoint_uri,
+            expires_at: Utc::now().timestamp() + ttl_secs,
+        };
+
+        let resume_token = SignedResumeToken::issue(resume_payload, &self.broker_signing_key)?;
+
+        // Emit AgentSignal alerting the client/UI that user input is needed
+        let signal = AgentSignal {
+            signal_id: Uuid::now_v7(),
+            receipt_id,
+            agent_id: agent_id.clone(),
+            service_name,
+            status: receipt.status.clone(),
+            message: format!("Interactive input required: {}", question),
+            pickup_url: format!("/api/v1/sessions/{}/resume", session_id),
+            timestamp: Utc::now().timestamp(),
+        };
+
+        let _ = self.signal_bus.send(signal);
+
+        tracing::info!(
+            "Task for receipt {} parked awaiting input. ResumeToken issued for session {}",
+            receipt_id,
+            session_id
+        );
+
+        Ok(resume_token)
+    }
+
+    /// User/client supplies answer along with SignedResumeToken to continue execution.
+    /// Resumption is stateless and verifiable by any worker without sticky routing.
+    pub fn resume_session(&self, req: SessionResumeRequest) -> Result<Receipt, CoreError> {
+        // 1. Stateless verification of agent token
+        let creds = req.agent_token.verify(&self.broker_verifying_key)?;
+
+        // 2. Stateless verification of resumption token
+        let resume_payload = req.resume_token.verify(&self.broker_verifying_key)?;
+        let receipt_id = resume_payload.receipt_id;
+
+        let mut receipts = self.receipts.write().unwrap();
+        let receipt = receipts
+            .get_mut(&receipt_id)
+            .ok_or(CoreError::ReceiptNotFound(receipt_id))?;
+
+        if receipt.agent_id != creds.agent_id {
+            return Err(CoreError::AgentMismatch);
+        }
+
+        // Verify task was actually parked
+        if !matches!(receipt.status, ReceiptStatus::ParkedAwaitingInput { .. }) {
+            return Err(CoreError::NotParked(receipt_id));
+        }
+
+        // Transition back to Processing
+        receipt.status = ReceiptStatus::Processing;
+        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
+        if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+            let _ = std::fs::write(receipt_path, data);
+        }
+
+        let service_name = receipt.service_name.clone();
+        let agent_id = receipt.agent_id.clone();
+        let topic = format!("service.{}.resumed", service_name);
+
+        // Notify workers via topic trie
+        self.topic_trie.publish(&topic, 0);
+
+        // Emit AgentSignal over SSE
+        let signal = AgentSignal {
+            signal_id: Uuid::now_v7(),
+            receipt_id,
+            agent_id: agent_id.clone(),
+            service_name,
+            status: ReceiptStatus::Processing,
+            message: format!(
+                "Session {} resumed with user input; processing continued",
+                resume_payload.session_id
+            ),
+            pickup_url: format!("/api/v1/receipts/{}/pickup", receipt_id),
+            timestamp: Utc::now().timestamp(),
+        };
+
+        let _ = self.signal_bus.send(signal);
+
+        tracing::info!(
+            "Session {} (receipt {}) successfully resumed. Answer recorded: {:?}",
+            resume_payload.session_id,
+            receipt_id,
+            req.answer
+        );
+
+        Ok(receipt.clone())
+    }
+
+    /// Cancel an in-flight receipt. Immediately updates receipt status to Failed/Cancelled,
+    /// persists to disk vault, and emits a cancellation AgentSignal so running workers abort inference loops.
+    pub fn cancel_receipt(
+        &self,
+        receipt_id: Uuid,
+        token: &SignedAgentToken,
+        reason: Option<String>,
+    ) -> Result<Receipt, CoreError> {
+        let creds = token.verify(&self.broker_verifying_key)?;
+
+        let mut receipts = self.receipts.write().unwrap();
+        let receipt = receipts
+            .get_mut(&receipt_id)
+            .ok_or(CoreError::ReceiptNotFound(receipt_id))?;
+
+        if receipt.agent_id != creds.agent_id {
+            return Err(CoreError::AgentMismatch);
+        }
+
+        let cancel_reason = reason.unwrap_or_else(|| "Client/Agent requested cancellation".into());
+        receipt.status = ReceiptStatus::Failed(format!("Cancelled: {}", cancel_reason));
+
+        // Persist to disk vault
+        let receipt_path = self.vault_dir.join(format!("{}.receipt.json", receipt_id));
+        if let Ok(data) = serde_json::to_string_pretty(&*receipt) {
+            let _ = std::fs::write(receipt_path, data);
+        }
+
+        let signal = AgentSignal {
+            signal_id: Uuid::now_v7(),
+            receipt_id,
+            agent_id: creds.agent_id.clone(),
+            service_name: receipt.service_name.clone(),
+            status: receipt.status.clone(),
+            message: format!("Task cancelled: {}", cancel_reason),
+            pickup_url: format!("/api/v1/receipts/{}", receipt_id),
+            timestamp: Utc::now().timestamp(),
+        };
+
+        let _ = self.signal_bus.send(signal);
+
+        tracing::info!("Receipt {} cancelled: {}", receipt_id, cancel_reason);
+
+        Ok(receipt.clone())
+    }
+
+    /// Dynamically trip or set backoff for a downstream service (e.g. slow legacy ERP, rate-limited API).
+    /// Incoming requests are still accepted and held safely in the append-only ledger, while worker dispatch is held.
+    pub fn set_service_backoff(
+        &self,
+        service_name: &str,
+        duration_secs: u64,
+        reason: String,
+        concurrency_cap: Option<usize>,
+    ) -> ServiceBackoff {
+        let backed_off_until = Utc::now().timestamp() + duration_secs as i64;
+        let backoff = ServiceBackoff {
+            service_name: service_name.to_string(),
+            backed_off_until,
+            reason,
+            concurrency_cap: concurrency_cap.unwrap_or(1),
+        };
+
+        {
+            let mut backoffs = self.service_backoffs.write().unwrap();
+            backoffs.insert(service_name.to_string(), backoff.clone());
+        }
+
+        tracing::warn!(
+            "Service '{}' backoff active until timestamp {} (reason: '{}', concurrency_cap: {})",
+            service_name,
+            backed_off_until,
+            backoff.reason,
+            backoff.concurrency_cap
+        );
+
+        backoff
+    }
+
+    /// Unset backoff and resume steady-state dispatch for a downstream service.
+    pub fn unset_service_backoff(&self, service_name: &str) -> bool {
+        let mut backoffs = self.service_backoffs.write().unwrap();
+        let was_backed_off = backoffs.remove(service_name).is_some();
+        if was_backed_off {
+            tracing::info!("Service '{}' backoff cleared; steady-state dispatch resumed", service_name);
+        }
+        was_backed_off
+    }
+
+    /// Get current backoff state for a service (if any)
+    pub fn get_service_backoff(&self, service_name: &str) -> Option<ServiceBackoff> {
+        let backoffs = self.service_backoffs.read().unwrap();
+        backoffs.get(service_name).cloned()
+    }
+
+    /// List all currently active service backoffs
+    pub fn list_service_backoffs(&self) -> Vec<ServiceBackoff> {
+        let backoffs = self.service_backoffs.read().unwrap();
+        let now = Utc::now().timestamp();
+        backoffs
+            .values()
+            .filter(|b| b.backed_off_until > now)
+            .cloned()
+            .collect()
+    }
+
+    /// Worker capacity lease allocation:
+    /// Workers request batches up to their current capacity slot ceiling,
+    /// preventing stampedes against slow or rate-limited downstream services.
+    pub fn lease_tasks(
+        &self,
+        req: WorkerLeaseRequest,
+        lease_ttl_secs: i64,
+    ) -> Result<WorkerLeaseResponse, CoreError> {
+        let receipts = self.receipts.read().unwrap();
+        let mut eligible_ids = Vec::new();
+
+        for (id, r) in receipts.iter() {
+            if r.status == ReceiptStatus::Queued {
+                if req.service_filter.as_deref().is_some_and(|f| f != r.service_name) {
+                    continue;
+                }
+                // Honor active service backoff!
+                if self.get_service_backoff(&r.service_name).is_some_and(|b| b.backed_off_until > Utc::now().timestamp()) {
+                    continue;
+                }
+                eligible_ids.push(*id);
+                if eligible_ids.len() >= req.max_tasks {
+                    break;
+                }
+            }
+        }
+        drop(receipts);
+
+        // Transition leased tasks to Processing
+        let mut receipts = self.receipts.write().unwrap();
+        for id in &eligible_ids {
+            if let Some(r) = receipts.get_mut(id) {
+                r.status = ReceiptStatus::Processing;
+                let receipt_path = self.vault_dir.join(format!("{}.receipt.json", id));
+                if let Ok(data) = serde_json::to_string_pretty(r) {
+                    let _ = std::fs::write(receipt_path, data);
+                }
+            }
+        }
+        drop(receipts);
+
+        let lease_id = Uuid::now_v7();
+        let now = Utc::now().timestamp();
+        let expires_at = now + lease_ttl_secs;
+
+        let active_lease = ActiveWorkerLease {
+            lease_id,
+            worker_id: req.worker_id.clone(),
+            service_filter: req.service_filter.clone(),
+            task_ids: eligible_ids.clone(),
+            granted_at: now,
+            expires_at,
+        };
+
+        {
+            let mut leases = self.worker_leases.write().unwrap();
+            leases.insert(lease_id, active_lease);
+        }
+
+        Ok(WorkerLeaseResponse {
+            lease_id,
+            worker_id: req.worker_id,
+            granted_tasks: Vec::new(),
+            lease_expires_at: expires_at,
+        })
+    }
+
+    /// Worker heartbeat keepalive: extends lease expiration
+    pub fn worker_heartbeat(&self, lease_id: Uuid, extend_secs: i64) -> Result<(), CoreError> {
+        let mut leases = self.worker_leases.write().unwrap();
+        if let Some(l) = leases.get_mut(&lease_id) {
+            l.expires_at = Utc::now().timestamp() + extend_secs;
+            Ok(())
+        } else {
+            Err(CoreError::ReceiptNotFound(lease_id))
+        }
     }
 
     /// Get current status of a receipt
@@ -537,6 +879,183 @@ mod tests {
             let fulfilled_receipt = engine2.get_receipt(req_id).unwrap();
             assert_eq!(fulfilled_receipt.status, ReceiptStatus::Fulfilled);
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_hitl_park_and_resume_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_hitl_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let agent_token = engine
+            .issue_agent_token("AGENT-USER-1", "User Agent", 86400)
+            .expect("Failed to issue token");
+
+        let mut signal_rx = engine.subscribe_signals();
+
+        // 1. Submit task
+        let request = ServiceRequest::new(
+            "quote.generate",
+            agent_token.clone(),
+            serde_json::json!({ "items": ["sku_1", "sku_2"] }),
+            None,
+        );
+        let req_id = request.request_id;
+        let receipt = engine.submit_service_request(request).await.expect("Submit failed");
+        assert_eq!(receipt.status, ReceiptStatus::Queued);
+
+        // 2. Worker begins work, needs clarification, and parks for HITL input
+        let resume_token = engine
+            .park_for_input(
+                req_id,
+                "What is your tax jurisdiction?".into(),
+                Some(serde_json::json!({ "type": "string", "enum": ["US-CA", "US-NY"] })),
+                Some("vault://checkpoint/turn-1".into()),
+                3600,
+            )
+            .expect("Park for input failed");
+
+        // 3. Verify signal sent to user/client over SSE
+        let park_signal = signal_rx.recv().await.expect("Failed to receive park signal");
+        assert_eq!(park_signal.receipt_id, req_id);
+        assert!(matches!(park_signal.status, ReceiptStatus::ParkedAwaitingInput { .. }));
+
+        // 4. Verify receipt status is now ParkedAwaitingInput
+        let parked_receipt = engine.get_receipt(req_id).unwrap();
+        assert!(matches!(parked_receipt.status, ReceiptStatus::ParkedAwaitingInput { .. }));
+
+        // 5. User provides answer using ResumeToken
+        let resume_request = SessionResumeRequest {
+            resume_token,
+            answer: serde_json::json!({ "jurisdiction": "US-CA" }),
+            agent_token: agent_token.clone(),
+        };
+
+        let resumed_receipt = engine.resume_session(resume_request).expect("Resume session failed");
+        assert_eq!(resumed_receipt.status, ReceiptStatus::Processing);
+
+        // 6. Verify resume signal was emitted over SSE
+        let resume_signal = signal_rx.recv().await.expect("Failed to receive resume signal");
+        assert_eq!(resume_signal.receipt_id, req_id);
+        assert_eq!(resume_signal.status, ReceiptStatus::Processing);
+
+        // 7. Worker completes the resumed task
+        let outcome = ServiceOutcome {
+            receipt_id: req_id,
+            agent_id: "AGENT-USER-1".into(),
+            service_name: "quote.generate".into(),
+            completed_at: Utc::now().timestamp(),
+            result: serde_json::json!({ "total": 120.50, "tax": 10.50 }),
+        };
+        engine.complete_service(outcome).expect("Completion failed");
+
+        let final_outcome = engine.pickup_outcome(req_id, &agent_token).expect("Pickup failed");
+        assert_eq!(final_outcome.result["total"], 120.50);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_service_backpressure_and_dynamic_backoff() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_backoff_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let agent_token = engine
+            .issue_agent_token("AGENT-PROD-01", "Production Agent", 86400)
+            .expect("Failed to issue token");
+
+        let service = "legacy_erp.reconcile";
+
+        // 1. Normal submission has default baseline ETA (5s)
+        let req1 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 1 }), None);
+        let receipt1 = engine.submit_service_request(req1).await.expect("Submit 1 failed");
+        assert_eq!(receipt1.estimated_ready_secs, Some(5));
+
+        // 2. Worker detects downstream 429/timeout and dynamically sets backoff (e.g. 60s)
+        let backoff = engine.set_service_backoff(
+            service,
+            60,
+            "ERP connection pool saturated; cooling down".into(),
+            Some(2),
+        );
+        assert_eq!(backoff.service_name, service);
+        assert_eq!(backoff.concurrency_cap, 2);
+
+        // 3. New requests submitted during backoff are still accepted (shock absorber) with adjusted ETA
+        let req2 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 2 }), None);
+        let receipt2 = engine.submit_service_request(req2).await.expect("Submit 2 during backoff should succeed");
+        assert_eq!(receipt2.status, ReceiptStatus::Queued);
+        // Estimated ready secs should reflect remaining backoff (~60s + base 5s = ~65s)
+        assert!(receipt2.estimated_ready_secs.unwrap() >= 60);
+
+        // 4. Verify backoff lookup
+        let active_backoffs = engine.list_service_backoffs();
+        assert_eq!(active_backoffs.len(), 1);
+        assert_eq!(active_backoffs[0].service_name, service);
+
+        // 5. Unset backoff (downstream recovered)
+        let cleared = engine.unset_service_backoff(service);
+        assert!(cleared);
+        assert!(engine.get_service_backoff(service).is_none());
+
+        // 6. Next request returns to normal baseline ETA
+        let req3 = ServiceRequest::new(service, agent_token.clone(), serde_json::json!({ "batch": 3 }), None);
+        let receipt3 = engine.submit_service_request(req3).await.expect("Submit 3 failed");
+        assert_eq!(receipt3.estimated_ready_secs, Some(5));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_and_worker_leases() {
+        let temp_dir = std::env::temp_dir().join(format!("roviers_cancel_test_{}", Uuid::now_v7()));
+        let engine = RoviersEngine::new(&temp_dir).expect("Failed to init engine");
+
+        let agent_token = engine
+            .issue_agent_token("AGENT-CANCEL-01", "Cancel Test Agent", 86400)
+            .expect("Failed to issue token");
+
+        // 1. Submit task and cancel it in-flight
+        let req = ServiceRequest::new(
+            "ai.heavy_reasoning",
+            agent_token.clone(),
+            serde_json::json!({ "prompt": "long reasoning" }),
+            None,
+        );
+        let req_id = req.request_id;
+        let _ = engine.submit_service_request(req).await.unwrap();
+
+        let cancelled_receipt = engine
+            .cancel_receipt(req_id, &agent_token, Some("User closed tab".into()))
+            .expect("Cancellation failed");
+        assert!(matches!(cancelled_receipt.status, ReceiptStatus::Failed(_)));
+
+        // 2. Submit 3 tasks and lease them via capacity leasing
+        for i in 0..3 {
+            let r = ServiceRequest::new(
+                "batch.worker_job",
+                agent_token.clone(),
+                serde_json::json!({ "idx": i }),
+                None,
+            );
+            let _ = engine.submit_service_request(r).await.unwrap();
+        }
+
+        let lease_req = WorkerLeaseRequest {
+            worker_id: "WORKER-NODE-01".into(),
+            service_filter: Some("batch.worker_job".into()),
+            max_tasks: 2,
+            available_tpm_budget: None,
+            active_inflight: 0,
+        };
+
+        let lease_resp = engine.lease_tasks(lease_req, 45).expect("Lease failed");
+        assert_eq!(lease_resp.worker_id, "WORKER-NODE-01");
+
+        // Verify heartbeat extension
+        let hb_res = engine.worker_heartbeat(lease_resp.lease_id, 60);
+        assert!(hb_res.is_ok());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -7,7 +7,11 @@ use axum::{
 };
 use futures::stream::Stream;
 use roviers_core::RoviersEngine;
-use roviers_proto::{Receipt, ServiceOutcome, ServiceRequest, SignedAgentToken};
+use roviers_proto::{
+    CancellationRequest, ParkForInputRequest, Receipt, ServiceBackoff, ServiceOutcome,
+    ServiceRequest, SessionResumeRequest, SetBackoffRequest, SignedAgentToken, SignedResumeToken,
+    WorkerHeartbeatRequest, WorkerLeaseRequest, WorkerLeaseResponse,
+};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -57,8 +61,20 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
         // Agent Auth
         .route("/api/v1/auth/agent", post(issue_agent_token))
         .route("/api/v1/auth/citizen", post(issue_agent_token)) // Backwards compatibility
-        // Service Intake
+        // Service Intake & Backpressure Management
         .route("/api/v1/services/{service_name}", post(submit_service))
+        .route(
+            "/api/v1/services/{service_name}/backoff",
+            post(set_service_backoff),
+        )
+        .route(
+            "/api/v1/services/{service_name}/resume",
+            post(unset_service_backoff),
+        )
+        .route(
+            "/api/v1/services/{service_name}/status",
+            get(get_service_status),
+        )
         // Receipts & Outcome Vault
         .route("/api/v1/receipts/{receipt_id}", get(get_receipt))
         .route("/api/v1/receipts/{receipt_id}/pickup", post(pickup_outcome))
@@ -66,6 +82,14 @@ pub fn create_app(engine: Arc<RoviersEngine>) -> Router {
             "/api/v1/receipts/{receipt_id}/complete",
             post(complete_receipt),
         )
+        // Interactive Human-In-The-Loop (HITL) Parking & Resumption
+        .route("/api/v1/receipts/{receipt_id}/park", post(park_for_input))
+        .route("/api/v1/sessions/{session_id}/resume", post(resume_session))
+        // In-Flight Task Cancellation
+        .route("/api/v1/receipts/{receipt_id}/cancel", post(cancel_receipt))
+        // Worker Capacity Leases & Heartbeats
+        .route("/api/v1/workers/lease", post(lease_tasks))
+        .route("/api/v1/workers/heartbeat", post(worker_heartbeat))
         // SSE Real-Time Completion Signals
         .route(
             "/api/v1/agents/{agent_id}/stream",
@@ -119,6 +143,57 @@ pub async fn submit_service(
             Err((StatusCode::CONFLICT, format!("Duplicate request: {}", id)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// Dynamically trip or set backoff for a downstream service
+pub async fn set_service_backoff(
+    State(state): State<AppState>,
+    Path(service_name): Path<String>,
+    Json(req): Json<SetBackoffRequest>,
+) -> Json<ServiceBackoff> {
+    let backoff = state.engine.set_service_backoff(
+        &service_name,
+        req.duration_secs,
+        req.reason,
+        req.concurrency_cap,
+    );
+    Json(backoff)
+}
+
+/// Clear backoff and resume steady-state dispatch for a downstream service
+pub async fn unset_service_backoff(
+    State(state): State<AppState>,
+    Path(service_name): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let cleared = state.engine.unset_service_backoff(&service_name);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "service_name": service_name, "backoff_cleared": cleared })),
+    )
+}
+
+/// Query current backoff and capacity status for a service
+pub async fn get_service_status(
+    State(state): State<AppState>,
+    Path(service_name): Path<String>,
+) -> Json<serde_json::Value> {
+    if let Some(backoff) = state.engine.get_service_backoff(&service_name) {
+        let now = chrono::Utc::now().timestamp();
+        let remaining_secs = (backoff.backed_off_until - now).max(0);
+        Json(serde_json::json!({
+            "service_name": service_name,
+            "status": "BACKING_OFF",
+            "backed_off_until": backoff.backed_off_until,
+            "remaining_secs": remaining_secs,
+            "reason": backoff.reason,
+            "concurrency_cap": backoff.concurrency_cap
+        }))
+    } else {
+        Json(serde_json::json!({
+            "service_name": service_name,
+            "status": "NORMAL"
+        }))
     }
 }
 
@@ -181,6 +256,96 @@ pub async fn complete_receipt(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
+}
+
+/// Worker parks task awaiting interactive human/agent input (HITL)
+pub async fn park_for_input(
+    State(state): State<AppState>,
+    Path(receipt_id): Path<Uuid>,
+    Json(req): Json<ParkForInputRequest>,
+) -> Result<Json<SignedResumeToken>, (StatusCode, String)> {
+    let ttl_secs = req.ttl_secs.unwrap_or(86400);
+    state
+        .engine
+        .park_for_input(
+            receipt_id,
+            req.question,
+            req.schema_for_answer,
+            req.checkpoint_uri,
+            ttl_secs,
+        )
+        .map(Json)
+        .map_err(|e| match e {
+            roviers_core::CoreError::ReceiptNotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })
+}
+
+/// User/client supplies answer and SignedResumeToken to resume parked task
+pub async fn resume_session(
+    State(state): State<AppState>,
+    Path(_session_id): Path<String>,
+    Json(req): Json<SessionResumeRequest>,
+) -> Result<Json<Receipt>, (StatusCode, String)> {
+    state
+        .engine
+        .resume_session(req)
+        .map(Json)
+        .map_err(|e| match e {
+            roviers_core::CoreError::Auth(_) | roviers_core::CoreError::AgentMismatch => {
+                (StatusCode::FORBIDDEN, e.to_string())
+            }
+            roviers_core::CoreError::ReceiptNotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+            roviers_core::CoreError::NotParked(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })
+}
+
+/// In-flight task cancellation
+pub async fn cancel_receipt(
+    State(state): State<AppState>,
+    Path(receipt_id): Path<Uuid>,
+    Json(req): Json<CancellationRequest>,
+) -> Result<Json<Receipt>, (StatusCode, String)> {
+    state
+        .engine
+        .cancel_receipt(receipt_id, &req.agent_token, req.reason)
+        .map(Json)
+        .map_err(|e| match e {
+            roviers_core::CoreError::Auth(_) | roviers_core::CoreError::AgentMismatch => {
+                (StatusCode::FORBIDDEN, e.to_string())
+            }
+            roviers_core::CoreError::ReceiptNotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })
+}
+
+/// Worker capacity lease acquisition
+pub async fn lease_tasks(
+    State(state): State<AppState>,
+    Json(req): Json<WorkerLeaseRequest>,
+) -> Result<Json<WorkerLeaseResponse>, (StatusCode, String)> {
+    state
+        .engine
+        .lease_tasks(req, 45)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Worker heartbeat keepalive
+pub async fn worker_heartbeat(
+    State(state): State<AppState>,
+    Json(req): Json<WorkerHeartbeatRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let extend_secs = req.extend_secs.unwrap_or(45);
+    state
+        .engine
+        .worker_heartbeat(req.lease_id, extend_secs)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| match e {
+            roviers_core::CoreError::ReceiptNotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })
 }
 
 /// List all active receipts for an agent
