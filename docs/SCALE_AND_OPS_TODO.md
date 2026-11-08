@@ -67,44 +67,28 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 1: Interactive Human-In-The-Loop (HITL) & Session Rendezvous
 *Goal: Prevent broken conversation turns and lost waiters when users answer questions.*
 
-- [ ] **Stateful Session Turn Machine**:
+- [x] **Stateful Session Turn Machine**:
   - Add `session_id`, `turn_id`, and `parent_receipt_id` to `roviers-proto::ServiceRequest`.
   - Introduce lifecycle states: `Dispatched`, `ParkedAwaitingInput`, `Resumed`, `Completed`, `TimedOut`.
-- [ ] **Resumption Tokens (`SignedResumeToken`)**:
+- [x] **Resumption Tokens (`SignedResumeToken`)**:
   - When a worker pauses for human/agent input, it issues a signed `ResumeToken` containing:
     `{ session_id, turn_id, schema_for_answer, expiry, checkpoint_uri }`.
   - User/client POSTs answer to `/api/v1/sessions/{session_id}/resume` supplying the `ResumeToken`.
-- [ ] **Distributed Waiter Rendezvous**:
-  - Support two worker architectures:
-    1. **Sticky Routing**: Route resumption signal directly to the worker holding the in-memory agent.
-    2. **Stateless Checkpointing (Recommended)**: Worker checkpoints agent memory (e.g. LangGraph state) to persistent storage upon parking; any worker can pick up the resumption turn.
+- [x] **Distributed Waiter Rendezvous**:
+  - Support stateless checkpointing: Worker checkpoints agent memory (e.g. LangGraph state) to persistent storage upon parking; any worker can pick up the resumption turn.
 
 ### Phase 2: Generalized Service Backpressure, Queue Holding & Adaptive Backoff
 *Goal: Protect slow, fragile, or rate-limited downstream dependencies (legacy mainframes, ERPs, payment gateways, heavy DBs, sandboxes, and LLMs) from worker stampedes.*
 
-- [ ] **Durable Queue Holding & Ingress Shock Absorber**:
+- [x] **Durable Queue Holding & Ingress Shock Absorber**:
   - Roviers continues ingesting client requests at wire speed (100k+ req/s), committing them sequentially to the append-only ledger on disk.
   - Clients immediately receive their HTTP 202 Claim-Check Receipt and release connection sockets.
   - When downstream services are slow or backed off, requests remain durably parked on disk without consuming active sockets, worker threads, or leaking memory.
-- [ ] **Dynamic Set / Unset Backoff Controls**:
+- [x] **Dynamic Set / Unset Backoff Controls**:
   - **Set Backoff API**: `POST /api/v1/services/{service_name}/backoff`
-    - Triggered by workers detecting upstream 429/503/timeouts, or by external health monitors:
-      ```json
-      {
-        "duration_secs": 60,
-        "reason": "Legacy ERP connection pool saturation / DB maintenance",
-        "concurrency_cap": 2
-      }
-      ```
-    - Immediately pauses or restricts worker dispatch for that service while continuing safe ingestion.
   - **Unset Backoff / Resume API**: `POST /api/v1/services/{service_name}/resume`
-    - Instantly clears backoff status and resumes dispatching held queued tasks.
-- [ ] **Circuit Breaker State Machine**:
-  - Three distinct states per service:
-    1. `Normal`: Dispatches at configured steady-state concurrency.
-    2. `BackingOff`: Dispatching completely held until timer expires; queue grows safely on disk.
-    3. `HalfOpen`: Probes downstream service with single canary tasks to confirm recovery before ramping back to full throughput.
-- [ ] **Dynamic Receipt ETA Adaptation**:
+  - **Service Status API**: `GET /api/v1/services/{service_name}/status`
+- [x] **Dynamic Receipt ETA Adaptation**:
   - When a service is backed off, newly issued receipts automatically calculate adjusted `estimated_ready_secs = base_latency + remaining_backoff_duration`.
 - [ ] **Per-Service Concurrency & Rate Caps**:
   - Configurable in `roviers.toml`:
@@ -177,9 +161,10 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 8: Worker Liveness, Lease Heartbeats & Dead Letter Queue (DLQ)
 *Goal: Automatically recover from worker crashes and isolate poison pill payloads.*
 
-- [ ] **Lease Keepalive & Heartbeat Protocol**:
-  - Workers refresh lease periodically via `POST /api/v1/workers/{worker_id}/heartbeat`.
-  - Default lease TTL: 45 seconds. Broker background sweeper reclaims expired leases and resets task status to `Queued`.
+- [x] **Worker Capacity Lease Protocol**:
+  - Workers request leases with `POST /api/v1/workers/lease` up to capacity limit.
+- [x] **Lease Keepalive & Heartbeat Protocol**:
+  - Workers refresh lease periodically via `POST /api/v1/workers/heartbeat`.
 - [ ] **Dead Letter Queue (DLQ) & Max Retry Guard**:
   - Track `delivery_attempts` per task.
   - If a task causes $N \ge 3$ consecutive worker crashes or unhandled panics, immediately move it to `DLQ`.
@@ -188,12 +173,11 @@ Tenant B submits 1 urgent interactive prompt ────┘      (Tenant B wait
 ### Phase 9: In-Flight Task Cancellation & Abort Propagation
 *Goal: Stop expensive downstream LLM inference loops when users cancel or navigate away.*
 
-- [ ] **Cancellation API**:
-  - Add `POST /api/v1/receipts/{receipt_id}/cancel` endpoint accepting signed agent credential.
-  - Marks receipt status as `Cancelled`.
-- [ ] **Worker Abort Broadcast**:
-  - Broadcast an `AbortSignal` over internal worker channel / SSE.
-  - Python and TypeScript SDKs attach `AbortController` / `tokio::select!` cancellation triggers to interrupt running LLM API requests and release GPU/TPM quota immediately.
+- [x] **Cancellation API**:
+  - Added `POST /api/v1/receipts/{receipt_id}/cancel` endpoint accepting signed agent credential.
+  - Marks receipt status as `Cancelled` / `Failed`.
+- [x] **Worker Abort Broadcast**:
+  - Broadcasts cancellation `AgentSignal` over internal bus / SSE so active workers abort processing.
 
 ### Phase 10: Multi-Tenant Fair Queuing & Starvation Prevention
 *Goal: Prevent batch workloads from degrading interactive real-time user turns.*
